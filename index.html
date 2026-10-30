@@ -1,0 +1,1947 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f4f7f4">
+
+<!-- ===================================================================
+     ⭐ 添加到手机桌面（2026-10-30）
+     -------------------------------------------------------------------
+     目标: 不加服务器、不加域名，让手机上一按图标就全屏打开这个面板，
+           看起来和用小程序几乎一样。
+     做法: ① iOS Safari 靠 apple-* 这几个 meta —— 加完「添加到主屏幕」
+               就会全屏、无地址栏、用下面的图标 ✓
+           ② Android Chrome 靠 manifest.json + 图标 —— 同样是全屏快捷方式 ✓
+     ⚠ 故意**不做** Service Worker（离线缓存）:
+        这个面板每次都要连 MQTT 拿实时数据，离线缓存没有意义；
+        更糟的是 SW 会把旧面板长期粘在手机里 —— 我们已经踩过
+        "面板版本对不上、其实是缓存旧文件" 的坑 ✗ 不给自己找麻烦 ✓
+     =================================================================== -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="小院">
+<meta name="application-name" content="小院控制">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+
+<title>我家小院 · 控制台</title>
+<style>
+  :root{
+    --bg:#f2f6f2; --card:#fff; --line:#e3e9e3; --line2:#eff3ef;
+    --fg:#1e2a23; --dim:#6a7d71; --ok:#1f9d55; --okbg:#e8f6ee;
+    --warn:#c07200; --warnbg:#fff5e3; --bad:#cf3a3a; --badbg:#fdeceb;
+    --acc:#2f6fd0; --soil:#2f9e5f; --sh:0 1px 3px rgba(30,42,35,.07);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    padding:10px 10px 44px;max-width:980px;margin:0 auto}
+  /* ⭐ 全屏（添加到桌面）时躲开刘海和底部横条 —— 否则标题会被状态栏压住 ✗
+     viewport-fit=cover 已经在 <meta viewport> 里，这里补安全区内边距 ✓ */
+  @supports(padding:max(0px)){
+    body{
+      padding-top:max(10px, env(safe-area-inset-top));
+      padding-left:max(10px, env(safe-area-inset-left));
+      padding-right:max(10px, env(safe-area-inset-right));
+      padding-bottom:max(44px, calc(env(safe-area-inset-bottom) + 28px));
+    }
+  }
+  h1{font-size:19px;margin:6px 0 8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  h1 .sub{font-size:12px;color:var(--dim);font-weight:400}
+
+  /* ---------- 节点选择（我家小院 / 车库花坛 / 老家菜地） ----------
+     ⭐ 2026-10-30: 原来切设备要钻进「连接设置」下拉框里选 —— 手机上太绕 ✗
+     现在顶部三个大按钮直接点，一眼看到当前在看哪块地 ✓ */
+  .nodes{display:flex;gap:7px;margin:0 0 10px}
+  .nodes .node{flex:1 1 0;min-width:0;font:inherit;font-size:13px;font-weight:600;
+    padding:10px 4px;border:1px solid var(--line);border-radius:11px;background:var(--card);
+    color:var(--dim);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    transition:background .15s,border-color .15s,color .15s}
+  .nodes .node:active{transform:scale(.98)}
+  .nodes .node.on{background:var(--okbg);border-color:var(--ok);color:#12683c;
+    box-shadow:0 0 0 1px var(--ok) inset}
+
+  /* ---------- 全局状态条 ---------- */
+  .bar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+    background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:9px 12px;margin-bottom:10px;box-shadow:var(--sh)}
+  /* ⭐ 版本标记行: 面板版本 + 固件版本, 用来一眼分辨"是不是新面板/固件有没有重烧" */
+  .verline{font-size:11px;color:var(--dim);margin:-4px 2px 10px;letter-spacing:.2px}
+  .verline b{color:var(--acc);font-weight:600}
+  /* ⭐ 版本行末尾的「清零」按钮: 现场换完固件要重置基线时, 手机也能一点就清 */
+  .verline .mini{font:inherit;font-size:10.5px;padding:2px 9px;margin-left:7px;
+    border-radius:20px;border:1px solid var(--line);background:#fff;color:var(--dim);
+    cursor:pointer;letter-spacing:0}
+  .verline .mini:active{background:var(--line2)}
+
+  /* ⭐ 参数快照浮层 —— 换芯片前导出参数用
+     为什么需要: 新板 NVS 是空的, 所有运行期参数会回到编译期默认值
+     最危险的一条: levelLowCm 现场是 51, 默认是 85 → 自动补水直接失效 ✗
+     所以在现场换板前必须有一份可复制的参数清单 ✓ */
+  .dump{position:fixed;inset:0;background:rgba(30,42,35,.45);display:none;
+    align-items:center;justify-content:center;padding:12px;z-index:99}
+  .dump.show{display:flex}
+  .dump .box{background:#fff;border-radius:14px;width:100%;max-width:640px;
+    max-height:88vh;display:flex;flex-direction:column;overflow:hidden;
+    box-shadow:0 8px 30px rgba(0,0,0,.28)}
+  .dump .hd{padding:12px 14px;font-weight:700;font-size:14px;border-bottom:1px solid var(--line);
+    display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .dump .hd .sub{font-weight:400;font-size:11.5px;color:var(--dim)}
+  .dump .bd{padding:10px 14px;overflow:auto;flex:1}
+  .dump textarea{width:100%;height:44vh;font:12px/1.55 ui-monospace,Menlo,Consolas,monospace;
+    border:1px solid var(--line);border-radius:9px;padding:9px;resize:vertical;
+    background:#fbfdfb;color:var(--fg)}
+  .dump .ft{padding:10px 14px;border-top:1px solid var(--line);
+    display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;
+    flex:0 0 auto}          /* ⭐ 不许被上下挤压/裁掉: 5 个按钮在手机上会换行 */
+  .dump .ft .gh{min-width:auto;flex:0 0 auto;font-size:13px;padding:7px 12px}
+  .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;
+    background:var(--line2);color:var(--dim);font-size:12px;white-space:nowrap}
+  .pill.ok{background:var(--okbg);color:var(--ok)}
+  .pill.bad{background:var(--badbg);color:var(--bad)}
+  .pill.warn{background:var(--warnbg);color:var(--warn)}
+  .pill .d{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .spacer{flex:1}
+
+  .lock{display:none;background:var(--warnbg);border:1px solid #f0d9a8;color:#7a4a00;
+    border-radius:12px;padding:11px 13px;margin-bottom:10px;font-size:13.5px}
+  .lock.show{display:block}
+  .lock b{display:block;margin-bottom:4px;font-size:14px}
+
+  /* ⭐ 设备离线横幅
+     为什么必须有: 设备掉线的那 1~3 秒里, 面板发出的指令会被 broker **直接丢弃**
+     (设备订阅是 QoS 0, broker 不为离线订阅者保留消息)。
+     现场表现就是"点了一下没反应, 过一会儿又好了" —— 用户以为设备不听话 ✗
+     所以必须显眼提示: 离线期间的操作可能无效 ✓ */
+  .offbar{display:none;background:var(--badbg);border:1px solid #f0bcbc;color:var(--bad);
+    border-radius:12px;padding:11px 13px;margin-bottom:10px;font-size:13.5px;font-weight:700}
+  .offbar.show{display:block}
+  .offbar .sub{display:block;font-weight:400;margin-top:5px;font-size:12.5px;line-height:1.55;
+    color:#8a3a3a}
+
+  /* ⭐ 数据陈旧标记: 超过 90 秒没收到新报文就把数值压暗
+     目的: 让"这个数字是真的还是老的"一眼可辨 ✓
+     (现场痛点: 增氧泵一直显示"开", 分不清是设备真开着还是显示卡住了) */
+  body.stale .mod .main-val,
+  body.stale .mod .kv2,
+  body.stale .mod .reason{opacity:.38}
+  body.stale .mod{border-color:#e8d2d2}
+
+  /* ---------- 模块网格 ---------- */
+  .board{display:grid;gap:10px;grid-template-columns:1fr}
+  @media(min-width:720px){ .board{grid-template-columns:1fr 1fr} }
+
+  /* ⭐ 精简设备（如 garden-laojia）: 只接 1 路土壤 + 双浮球, 没有照明 / 空气温湿度 /
+     预留输出 / 喂食器 —— 在 body 上加 .basic 后整体隐藏(见 updateStatus)。
+     这样一份面板就能同时服务"全功能"和"精简"两种设备, 不用改渲染逻辑 ✓ */
+  body.basic [data-block="light"],
+  body.basic [data-block="air"],
+  body.basic [data-block="aux"],
+  body.basic [data-block="feed"],
+  body.basic [data-block="missing"]{display:none!important}
+  body.basic [data-feed],
+  body.basic [data-tog="aux1"]{display:none!important}
+
+  /* ⭐ 纯土壤节点（garden-lab / 车库花坛）: 连水箱补水都没有 —— 它只有一个土壤探头。
+     再藏掉「水箱补水」这块，否则会显示一个永远无效的补水阀 ✗
+     ⭐ 顶部"气象 / 空气"两个胶囊也藏掉: 这台设备没有这些传感器，
+        显示「气象无数据 / 空气 未接入」纯属噪音 ✗ */
+  body.lab [data-block="tank"]{display:none!important}
+  body.lab #pWx,
+  body.lab #pAir{display:none!important}
+
+  .mod{background:var(--card);border:1px solid var(--line);border-radius:13px;
+    box-shadow:var(--sh);overflow:hidden;display:flex;flex-direction:column}
+  .mod.wide{grid-column:1/-1}
+  .mod.off{background:#fcfdfc}
+  .mod-h{display:flex;align-items:center;gap:8px;padding:10px 13px;
+    border-bottom:1px solid var(--line2);background:#fafcfa}
+  .mod-h .ic{font-size:16px;line-height:1}
+  .mod-h .nm{font-weight:700;font-size:14.5px}
+  .mod-h .st{margin-left:auto;font-size:11px;padding:2px 8px;border-radius:20px;
+    background:var(--line2);color:var(--dim);font-weight:600;white-space:nowrap}
+  .mod-h .st.on{background:var(--okbg);color:var(--ok)}
+  .mod-h .st.warn{background:var(--warnbg);color:var(--warn)}
+  .mod-h .st.bad{background:var(--badbg);color:var(--bad)}
+  .mod-h .st.acc{background:#eaf1fb;color:var(--acc)}
+
+  .mod-b{padding:12px 13px;display:flex;flex-direction:column;gap:10px;flex:1}
+
+  /* 主数值(湿度/水位这类) */
+  .main-val{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
+  .main-val .num{font-size:33px;font-weight:700;line-height:1;
+    font-variant-numeric:tabular-nums;color:var(--soil)}
+  .main-val .num small{font-size:15px;font-weight:600;color:var(--dim);margin-left:1px}
+  .main-val .num.warn{color:var(--warn)}
+  .main-val .num.bad{color:var(--bad);font-size:24px}
+  .main-val .side{font-size:11.5px;color:var(--dim);padding-bottom:4px}
+  .track{height:7px;background:var(--line2);border-radius:4px;overflow:hidden;position:relative}
+  .track i{display:block;height:100%;border-radius:4px;background:var(--soil);transition:width .35s}
+  .track i.warn{background:var(--warn)}
+  /* 阈值刻线 */
+  .track .mk{position:absolute;top:-3px;bottom:-3px;width:2px;background:#b9c7bd;border-radius:2px}
+  .track .mk.lo{background:#d9a94a}
+  .track .mk.hi{background:#4a9ad9}
+  .scale{display:flex;justify-content:space-between;font-size:10.5px;color:var(--dim)}
+
+  /* 键值行 */
+  .kv{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}
+  .kv .k{color:var(--dim);flex:0 0 auto}
+  .kv .v{text-align:right;font-variant-numeric:tabular-nums}
+  .kv2{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:12.5px}
+  .kv2 .k{color:var(--dim)}
+  .kv2 .v{text-align:right;font-variant-numeric:tabular-nums}
+
+  .reason{font-size:12px;color:var(--dim);background:#f7faf7;border-radius:8px;
+    padding:7px 9px;line-height:1.45}
+  .reason b{color:var(--fg);font-weight:600}
+
+  /* 操作区 */
+  .ops{display:flex;gap:8px;flex-wrap:wrap;margin-top:auto;padding-top:2px}
+  button{font:inherit;font-size:14px;color:var(--fg);background:#fff;
+    border:1px solid var(--line);border-radius:9px;padding:10px 15px;cursor:pointer;
+    transition:background .15s,transform .05s;white-space:nowrap;flex:1 1 auto}
+  button:active{transform:scale(.975)}
+  button:disabled{opacity:.5;cursor:default}
+  button.pri{font-weight:700}
+  button.pri.on{background:var(--ok);border-color:var(--ok);color:#fff}
+  button.busy{background:var(--line2);color:var(--dim)}
+  button.gh{flex:0 0 auto;font-size:13px;padding:10px 12px;color:var(--acc);
+    border-color:#cfe0f5;background:#f5f9ff}
+
+  .tag{font-size:10.5px;padding:1.5px 7px;border-radius:20px;background:var(--line2);
+    color:var(--dim);font-weight:600;white-space:nowrap}
+  .tag.manual{background:var(--warnbg);color:var(--warn)}
+  .tag.auto{background:#eaf1fb;color:var(--acc)}
+  .tag.err{background:var(--badbg);color:var(--bad)}
+  .tag.miss{background:#f1f4f1;color:#9aab9f}
+
+  .hint{font-size:11.5px;color:var(--dim);margin:0;line-height:1.5}
+  .setstat{margin-top:9px;padding:9px 11px;border-radius:9px;font-size:12.5px;
+    background:var(--line2);color:var(--dim);line-height:1.55}
+  .setstat.ok{background:var(--okbg);color:var(--ok)}
+  .setstat.bad{background:var(--badbg);color:var(--bad)}
+  .setstat.warn{background:var(--warnbg);color:var(--warn)}
+  .setstat b{font-weight:700}
+  .setstat code{background:rgba(0,0,0,.06)}
+
+  /* ---------- 参数设置 ---------- */
+  .cfggrp+.cfggrp{margin-top:13px;padding-top:12px;border-top:1px solid var(--line2)}
+  .cfggrp>.ct{font-size:11.5px;font-weight:700;color:var(--dim);
+    letter-spacing:.05em;margin-bottom:8px}
+  .cfgrow{display:grid;grid-template-columns:1fr 112px;gap:10px;align-items:center;
+    padding:5px 0}
+  .cfgrow .cl{font-size:13px;line-height:1.4}
+  .cfgrow .cu{font-size:11px;color:var(--dim);display:block;margin-top:1px;line-height:1.45}
+  .cfgrow input{text-align:right;font-variant-numeric:tabular-nums;padding:8px 10px}
+  .cfgrow input.dirty{border-color:var(--warn);background:var(--warnbg);font-weight:700}
+  .cfgsave{display:flex;align-items:center;gap:10px;margin-top:12px;
+    padding-top:11px;border-top:1px solid var(--line2)}
+  .cfgsave .cs{flex:1;font-size:12px;color:var(--dim);line-height:1.5}
+  .cfgsave .cs.warn{color:var(--warn)}
+  .cfgsave .cs.ok{color:var(--ok)}
+  .cfgsave .cs.bad{color:var(--bad)}
+  .cfgsave button{flex:0 0 auto}
+  .empty{color:var(--dim);font-size:13px;padding:4px 0}
+
+  /* 平面图占位(未来) —— 给模块一个定位锚点用的钩子 */
+  .mod[data-block]{position:relative}
+
+  details.set{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    margin-top:10px;box-shadow:var(--sh)}
+  details.set>summary{cursor:pointer;padding:11px 14px;font-size:13px;color:var(--dim);
+    font-weight:600;list-style:none;display:flex;align-items:center;gap:6px}
+  details.set>summary::-webkit-details-marker{display:none}
+  details.set>summary::before{content:"⚙"}
+  .setbody{padding:0 14px 14px}
+  .fld{margin-bottom:9px}
+  .fld label{display:block;font-size:11.5px;color:var(--dim);margin-bottom:3px}
+  input{font:inherit;font-size:14px;color:var(--fg);background:#fbfdfb;
+    border:1px solid var(--line);border-radius:9px;padding:9px 10px;width:100%}
+  .row-end{display:flex;gap:8px;justify-content:flex-end;margin-top:4px}
+  code{background:var(--line2);padding:1px 5px;border-radius:5px;font-size:11.5px}
+  pre{background:#f7faf7;border:1px solid var(--line);border-radius:9px;padding:9px;
+    overflow:auto;max-height:200px;font-size:11px;color:#41564a;margin:0;
+    white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+
+<h1><span id="nodeIcon">🌱</span> <span id="nodeLabel">我家小院</span> <span class="sub" id="devName"></span></h1>
+
+<!-- ⭐ 节点切换（点选，不用钻进连接设置） -->
+<div class="nodes" id="nodeBar"></div>
+
+<div class="bar">
+  <span class="pill" id="pDev"><span class="d"></span>设备离线</span>
+  <span class="pill" id="pMq"><span class="d"></span>MQTT 未连接</span>
+  <span class="pill" id="pAge"><span class="d"></span>无数据</span>
+  <span class="pill" id="pWx"><span class="d"></span>气象 --</span>
+  <span class="pill" id="pAir"><span class="d"></span>空气 --</span>
+  <span class="spacer"></span>
+  <button id="btnReconnect" style="flex:0 0 auto;font-size:12.5px;padding:6px 11px">重新连接</button>
+</div>
+
+<!-- ⭐ 版本标记：一眼看出"当前加载的是不是新面板 / 固件有没有跟着更新"。
+     面板旧了(缓存)会显示旧日期；固件没重烧会显示旧版本号。 -->
+<div class="verline">面板 <b id="verPanel">-</b> · 固件 <b id="verFw">-</b> · 面板重连 <b id="verRec">0</b> 次 · 设备离线 <b id="verDevOff">0</b>
+  <button id="btnClearStat" class="mini" title="清零统计">清零</button></div>
+
+<!-- ⭐ 设备离线横幅（由 updateBanner() 控制显示） -->
+<div class="offbar" id="offBar"></div>
+
+<div class="lock" id="lockBar"></div>
+
+<style>
+/* ⭐ 卡片标题栏右上角的「读数」按钮
+   用途: 让这一路立刻采一次实时数据 —— 土壤平时 1 小时才采一次,
+        接完线/标定时等不起, 点一下就出数。
+   位置: 紧跟在标题栏的状态标签右边(即卡片顶端), 每张输入卡片各有自己的一个。 */
+.mod-h .rd{margin-left:6px;flex:0 0 auto;font:inherit;font-size:11px;padding:3px 9px;
+  border-radius:20px;border:1px solid #cfe0f5;background:#f5f9ff;color:var(--acc);
+  cursor:pointer;white-space:nowrap;transition:background .15s,transform .05s}
+.mod-h .rd:active{background:#e9f1fc;transform:scale(.97)}
+.mod-h .rd[disabled]{opacity:.5;cursor:default}
+</style>
+<div class="board" id="board"></div>
+
+<!-- ⭐ 远程诊断: 设备把最近 10 条日志发到 garden/<id>/diag，这里显示出来。
+     用途: 设备在 20km 外，"点了没反应"这类问题不用跑现场、不用串口，
+          看这里就知道"指令有没有到设备、执行器有没有动" ✓ -->
+<details class="set" id="diagPanel" style="margin-top:12px">
+  <summary>远程诊断（设备最近 10 条日志 · 排障用）</summary>
+  <div class="setbody">
+    <div id="diagHead" class="hint" style="margin-bottom:6px">— 还没有诊断数据 —</div>
+    <pre id="diag">—</pre>
+    <p class="hint">怎么看：点一个按钮后，若这里出现
+      <b>[MQTT] 收到 …</b> 说明指令到了设备；
+      再出现 <b>[ACT] xxx -&gt; ON</b> 说明执行器动作了。
+      两行都没有 = 指令根本没到设备（查 MQTT 下行）。</p>
+  </div>
+</details>
+
+<details class="set" id="cfgPanel">
+  <summary>参数设置（浇水 / 水位 / 判雨 / 自动喂鱼）</summary>
+  <div class="setbody">
+    <div id="cfgBody"><p class="hint">连接设备后自动载入当前参数。</p></div>
+    <div class="cfgsave">
+      <span class="cs" id="cfgStatus">改动后点「保存」，将一次性下发。</span>
+      <button id="btnCfgDump" class="gh" title="导出当前参数清单（换芯片前必备）">导出参数</button>
+      <button id="btnCfgRestore" class="gh" title="把之前导出的参数贴回来，一键填满表单">恢复参数</button>
+      <button id="btnCfgSave" class="gh">保存到设备</button>
+    </div>
+    <p class="hint">
+      参数改动后立即写入设备 Flash（断电不丢）。<b>「土壤上限」必须大于「土壤下限」</b>，否则设备会自动纠正并记录日志。
+    </p>
+  </div>
+</details>
+
+<!-- ⭐ 参数快照浮层（导出 / 恢复都在这里） -->
+<div class="dump" id="dumpBox">
+  <div class="box">
+    <div class="hd">参数快照 <span class="sub">换芯片前导出，换完一键恢复</span></div>
+    <div class="bd">
+      <textarea id="dumpText" spellcheck="false" placeholder="点「填入当前参数」生成快照；或把之前存下来的快照粘贴到这里，再点「从文本恢复」。"></textarea>
+      <p class="hint">
+        <b>换芯片后设备的 35 项参数会全部回到出厂默认</b>（NVS 在旧芯片里）。
+        用「从文本恢复」可以把它们一次性填回表单，然后<b>还要点「保存到设备」</b>才真正下发。
+      </p>
+    </div>
+    <div class="ft">
+      <button id="btnDumpFill" class="gh">填入当前参数</button>
+      <button id="btnDumpSave" class="gh">下载文件</button>
+      <button id="btnDumpCopy" class="gh">复制全部</button>
+      <button id="btnDumpRestore" class="gh">从文本恢复</button>
+      <button id="btnDumpClose" class="gh">关闭</button>
+    </div>
+  </div>
+</div>
+
+<details class="set">
+  <summary>连接设置</summary>
+  <div class="setbody">
+    <div class="fld"><label>Broker 地址</label><input id="host" placeholder="w105193b.ala.cn-shenzhen.emqxsl.cn"></div>
+    <div class="fld"><label>WebSocket 端口（8084 加密 wss / 8083 非加密 ws）</label><input id="port" placeholder="8084"></div>
+    <div class="fld"><label>用户名（私有 Broker 必填；公共 Broker 留空）</label><input id="muser" placeholder="liu_garden"></div>
+    <div class="fld"><label>密码</label><input id="mpass" type="password" placeholder="留空 = 不认证"></div>
+    <div class="fld"><label>WebSocket 路径（EMQX Cloud 是 /mqtt）</label><input id="mpath" placeholder="/mqtt"></div>
+    <div class="fld"><label>切换设备（家里 / 远端）</label><select id="devSel"></select></div>
+    <div class="fld"><label>设备 ID</label><input id="dev" placeholder="garden-4466"></div>
+    <div class="row-end">
+      <button id="btnConn" class="gh" style="flex:0 0 auto">连接</button>
+      <button id="btnDisc" style="flex:0 0 auto">断开</button>
+    </div>
+    <!-- 连接状态也显示在这里, 因为顶部状态条在页面最上方,
+         而用户点"连接"时屏幕正停在底部的设置区 —— 看不到顶部的变化会以为没反应 -->
+    <div id="setStatus" class="setstat">尚未连接</div>
+    <p class="hint">默认 <code>broker.emqx.io</code> + <code>8084</code>（加密）。连不上可换 <code>8083</code>。设置保存在本机浏览器。</p>
+  </div>
+</details>
+
+<details class="set">
+  <summary>原始报文（排查用）</summary>
+  <div class="setbody"><pre id="log">—</pre></div>
+</details>
+
+<!-- MQTT 客户端库。
+     原来只从 unpkg.com 取 —— 国内网络经常取不到, 表现就是整个面板"连不上"(其实库都没加载)。
+     现在依次尝试多个 CDN, 最后回落到同目录下的 mqtt.min.js: 把该文件下载到本 html 旁边,
+     即使完全没外网也能用。加载状态放在 window.__mqttLibState 里, 便于排查。 -->
+<script>
+(function(){
+  var urls=[
+    'https://unpkg.com/mqtt/dist/mqtt.min.js',
+    'https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js',
+    'https://cdn.bootcdn.net/ajax/libs/mqtt/5.10.1/mqtt.min.js',
+    'mqtt.min.js'                       // 本地副本(放同目录最稳)
+  ], i=0;
+  function finish(ok, which){
+    window.__mqttLibState = ok ? ('ok: '+which) : '全部失败';
+    if(ok && typeof connect === 'function'){ try{ connect(); }catch(e){} }   // 库一到就自动连
+  }
+  (function next(){
+    if(i>=urls.length){ finish(false); return; }
+    var u=urls[i++], s=document.createElement('script');
+    s.async=true; s.src=u;
+    s.onload =function(){ if(typeof mqtt!=='undefined') finish(true,u); else next(); };
+    s.onerror=function(){ next(); };
+    document.head.appendChild(s);
+  })();
+})();
+</script>
+<script>
+(function(){
+'use strict';
+var $ = function(id){ return document.getElementById(id); };
+var LSKEY='garden_dash_v3';
+
+/* ==========================================================================
+   未来「花园平面图视图」的接入点
+   --------------------------------------------------------------------------
+   现在每个模块都渲染成一个带 data-block 的 .mod 元素。要做平面图时:
+     1) 在页面里放一张平面图(图片或内联 SVG)作为背景容器
+     2) 给下面的 anchors 填好各模块的百分比坐标(相对背景图)
+     3) 加一个布局开关: 平面图模式下给容器加 .floorplan 类, 并遍历 anchors
+        把对应 [data-block] 元素设为 position:absolute; left/top 用锚点值
+   数据与 DOM 结构完全复用, 只是换一套 CSS 定位 —— 不需要重写任何渲染逻辑。
+   ========================================================================== */
+var FLOORPLAN = {
+  enabled:false,
+  image:'',                 // 平面图路径, 例如 'garden.png'
+  anchors:{                 // 百分比坐标 {x,y}, 未来按你的实际花园填
+    zoneA : null,           // 例如 {x:22, y:38}
+    zoneB : null,
+    zoneC : null,
+    tank  : null,
+    light : null,
+    aux   : null
+  }
+};
+
+var NAME={water_a:'浇水 A',water_b:'浇水 B',water_c:'浇水 C',
+          refill:'水箱补水',light:'增氧泵',aux1:'自动喂鱼',aux2:'预留输出 2'};
+var FLOW={water_a:1,water_b:1,water_c:1,refill:1};
+
+var client=null,cfg={host:'w105193b.ala.cn-shenzhen.emqxsl.cn',port:'8084',
+                     dev:'garden-4466',user:'liu_garden',pass:'',path:'/mqtt'};
+
+// ⭐ 设备列表（一个面板管三地）: 再加一块地就在这里加一行 ✓
+//   设备 ID 必须和固件 config.h 里的 GARDEN_DEVICE_ID 完全一致
+//   ⚠ 顺序就是页面顶部按钮的显示顺序（左→右）
+var NODES=[
+  {dev:'garden-4466',   label:'我家小院', icon:'🌱'},
+  {dev:'garden-lab',    label:'车库花坛', icon:'🚗'},
+  {dev:'garden-laojia', label:'老家菜地', icon:'🏡'}
+];
+var DEVICES=NODES.map(function(n){ return n.dev; });
+
+// ⭐ 面板版本 —— 每次改面板都改这个日期。
+//   页面上会显示它: 如果还是旧日期, 说明手机加载的是**缓存里的旧面板** ✗
+//   (打开时在地址后面加 ?v=1027 这类参数可以强制重新拉)
+var PANEL_VER='2026-10-30f';   // h: 参数快照 导出/下载文件/一键恢复(换芯片丢参数) + 诊断 rec/wd + 清零 + 离线统计
+
+var S={};                    // 最新快照: sensors / zones / outputs / locks / state
+var outputs={},pending={},pendingWant={},lastDataAt=0;
+
+// 立刻把面板版本写到页面上(不需要等设备连上)
+if($('verPanel')) $('verPanel').textContent='v'+PANEL_VER;
+
+/* ---------- 本地配置(连接参数) ----------
+   注意: 这里刻意不做任何 DOM 访问 —— 脚本已被移到页面末尾,
+   但为了稳妥仍把所有 DOM 初始化放进 boot(), 避免元素未解析就取用。 */
+function loadLocal(){
+  try{ var sv=JSON.parse(localStorage.getItem(LSKEY)||'null'); if(sv) cfg=Object.assign(cfg,sv); }catch(e){}
+}
+function saveCfg(){
+  cfg={host:$('host').value.trim(),
+       port:$('port').value.trim(),
+       dev:$('dev').value.trim(),
+       user:$('muser').value.trim(),
+       pass:$('mpass').value,
+       path:($('mpath').value.trim()||'/mqtt')};
+  try{ localStorage.setItem(LSKEY,JSON.stringify(cfg)); }catch(e){}
+}
+
+// 设备下拉: 与顶部节点按钮**同一套逻辑**（选中即切换并重连，保持一致）
+function initDevSel(){
+  var sel=$('devSel'); if(!sel) return;
+  sel.innerHTML=DEVICES.map(function(d){return '<option>'+d+'</option>';}).join('')+
+                '<option value="__custom">自定义…</option>';
+  var cur=$('dev').value.trim()||cfg.dev;
+  sel.value=(DEVICES.indexOf(cur)>=0)?cur:'__custom';
+  sel.onchange=function(){
+    if(this.value!=='__custom'){ selectNode(this.value); }   // 走同一条切换路径
+    else { $('dev').focus(); }
+  };
+}
+function base(){ return 'garden/'+cfg.dev; }
+
+/* ⭐ 节点切换（顶部三个按钮: 我家小院 / 车库花坛 / 老家菜地）
+   —— 点一下就切，不用再钻进「连接设置」下拉框 ✓ */
+function renderNodes(){
+  var cur=(($('dev')&&$('dev').value.trim())||cfg.dev||'');
+  var hit=null;
+  for(var i=0;i<NODES.length;i++) if(NODES[i].dev===cur) hit=NODES[i];
+  var bar=$('nodeBar');
+  if(bar){
+    bar.innerHTML=NODES.map(function(n){
+      return '<button class="node'+(n.dev===cur?' on':'')+'" data-node="'+n.dev+'">'+
+             n.icon+' '+n.label+'</button>';
+    }).join('');
+  }
+  if($('nodeIcon'))  $('nodeIcon').textContent  = hit?hit.icon :'🌾';
+  if($('nodeLabel')) $('nodeLabel').textContent = hit?hit.label:'自定义节点';
+  document.title=(hit?hit.label:'自定义节点')+' · 小院控制';
+}
+
+function selectNode(dev){
+  if(!dev) return;
+  var cur=(($('dev')&&$('dev').value.trim())||cfg.dev||'');
+  if(dev===cur){ renderNodes(); return; }        // 已经在这块地上，不重连
+  if($('dev')) $('dev').value=dev;
+  cfg.dev=dev;
+  try{ localStorage.setItem(LSKEY,JSON.stringify(cfg)); }catch(e){}
+  // ⚠ 必须清空上一个节点的快照 —— 否则切过去会先显示旧地的湿度和阀门状态，
+  //   看着像"串台了" ✗（尤其三块地的区域数/输出数量都不一样）
+  S={}; outputs={}; pending={}; pendingWant={}; lastDataAt=0;
+  devOnline=false; lastErr='';
+  if($('devName')) $('devName').textContent='· '+dev;
+  renderNodes();
+  initDevSel();
+  if(typeof devStatLoad==='function'){ devStatLoad(); showDevStat(); }   // 离线统计也跟着切
+  if(typeof render==='function')       render();
+  if(typeof updateStatus==='function') updateStatus();
+  connect();
+}
+
+// 顶部节点按钮的点击代理（找不到元素也不能让整段脚本挂掉 ✗）
+(function(){
+  var nb=$('nodeBar'); if(!nb) return;
+  nb.addEventListener('click',function(ev){
+    var b=ev.target.closest('button[data-node]'); if(!b) return;
+    selectNode(b.getAttribute('data-node'));
+  });
+})();
+
+function pill(el,cls,text){ el.className='pill'+(cls?' '+cls:''); el.innerHTML='<span class="d"></span>'+text; }
+
+/* ---------- 连接状态 (同时更新顶部状态条与设置区内的提示) ---------- */
+var connState='idle';   // idle | connecting | connected | failed | noconf
+var connDevId='';       // 已连接时实际订阅的设备 ID(用于检测"改了却没重连")
+var devOnline=false, lastErr='';
+
+// ⭐⭐ 设备在线判定的宽限计时器
+//   原逻辑: setConn('connecting') 一上来就把 devOnline 清成 false ✗
+//   而面板每次重连(网络抖一下、手机切后台回来)都会走 'connecting' →
+//   **面板自己的抖动被误报成"设备离线"** ✗ (现场真见过: 只闪 1~3 秒)
+//   现在: 8 秒宽限。期间收到 availability 就取消; 8 秒仍没收到才算离线 ✓
+//   代价: 设备真掉线时晚 8 秒告警(可接受) ✓
+var devOfflineTimer=0;
+var DEV_GRACE_MS=8000;
+
+// ⭐⭐ 面板自己重连了几次
+//   为什么必须单独数: 现场观察到"Mqtt 标签变黄(连接中) + 设备在线闪离线"同时发生,
+//   说明是**面板自己**与 broker 断开 ✗ 而面板断线的那几秒里点击 → pub() 直接拦下,
+//   指令**根本没发出去** —— 这和"设备掉线丢指令"是两个不同的坑, 表现却一样 ✗
+//   有了这个计数, 一眼就能分清到底是谁在掉线 ✓
+var panelReconnects=0;
+function showPanelReconnects(){
+  var el=$('verRec'); if(el) el.textContent=String(panelReconnects);
+}
+
+/* ⭐⭐⭐ 设备离线统计（纯面板侧，不依赖固件版本）
+   背景: 1.2.4 固件没有 rec 字段，但 availability(LWT 遗嘱消息) 本身就能
+        真实反映掉线 —— broker 在设备异常断开时代它发 `offline`，重连后发 `online` ✓
+
+   计数规则（这里最容易做错）:
+     availability 是 **retained** 的 —— 面板每次连上/重连都会重新收到一条"当前值"。
+     如果收到 offline 就 +1，会**重复计数** ✗
+     所以只在 **online → offline 的转变** 时 +1 ✓
+
+   持久化: localStorage，按设备 ID 分开存 → 刷新面板不清零，可以跨天累计 ✓
+
+   ⚠ 局限(必须说清楚): 只能统计**面板开着的时候**发生的掉线 ✗
+     面板关掉、电脑休眠、手机息屏期间掉的，这里看不到 ——
+     那种要等固件 1.2.5 的 rec 字段（设备自己数，永久累计）✓
+*/
+var DEV_STAT_KEY='devstat_';
+var devStat={off:0,lastOffAt:0,offTotalS:0,watchFrom:0};
+
+function devStatLoad(){
+  try{
+    var raw=localStorage.getItem(DEV_STAT_KEY+devIdNow());
+    var s=raw?JSON.parse(raw):null;
+    if(s && typeof s==='object'){
+      devStat={off:s.off|0, lastOffAt:s.lastOffAt|0,
+               offTotalS:s.offTotalS|0, watchFrom:s.watchFrom|0};
+      return;
+    }
+  }catch(e){}
+  devStat={off:0,lastOffAt:0,offTotalS:0,watchFrom:Date.now()};
+  devStatSave();
+}
+function devStatSave(){
+  try{ localStorage.setItem(DEV_STAT_KEY+devIdNow(), JSON.stringify(devStat)); }catch(e){}
+}
+function showDevStat(){
+  var el=$('verDevOff');
+  if(!el) return;
+  var txt=String(devStat.off);
+  if(devStat.offTotalS>0) txt+=' 次 · 累计离线 '+Math.round(devStat.offTotalS)+' 秒';
+  else txt+=' 次';
+  el.textContent=txt;
+}
+
+/* ⭐ 清零统计（版本行那个「清零」按钮 + 手动调用都能用）
+   清的是**观测计数**，不碰设备、不碰配置 ✓
+   为什么需要: 换固件前后要分别统计，混在一起就没法对比 ✗ */
+function clearDevStat(){
+  var msg='清零统计？\n\n将清除:\n· 设备离线次数与累计离线秒数\n· 面板重连次数\n\n'+
+          '不影响设备运行，也不改任何参数。';
+  if(typeof confirm==='function' && !confirm(msg)) return;
+  devStat={off:0,lastOffAt:0,offTotalS:0,watchFrom:Date.now()};
+  devStatSave();
+  panelReconnects=0;
+  // 如果此刻设备正好是离线的, 保留 lastOffAt 会让下次恢复时把这段算进去。
+  if(!devOnline) devStat.lastOffAt=Date.now();
+  devStatSave();
+  showDevStat();
+  showPanelReconnects();
+  if(typeof logLine==='function') logLine('conn','🧹 统计已清零');
+}
+
+function devIdNow(){ var v=$('dev').value.trim(); return v||cfg.dev; }
+
+function updateStatus(){
+  var cls='', top='MQTT 未连接', sub='尚未连接。';
+  var devId=devIdNow();
+  var changed=(connState==='connected' && connDevId && connDevId!==devId);
+
+  // ⭐ 精简设备: 隐藏它没有的模块(照明/空气温湿度/预留输出/喂食)
+  //   laojia = 老家菜地(1 路土壤 + 双浮球 + 补水阀)
+  //   lab    = 车库花坛(纯土壤节点, 一个继电器都没有)  ← 2026-10-30 新增
+  var isLab = /lab/i.test(devId);
+  document.body.classList.toggle('basic', /laojia|lab/i.test(devId));
+  // lab 再多藏一块「水箱补水」—— 土壤节点没有水箱也没有补水阀，留着会误导 ✗
+  document.body.classList.toggle('lab', isLab);
+
+  if(connState==='noconf'){
+    cls='bad'; top='请先填写设置';
+    sub='<b>请先填写 Broker 地址和设备 ID。</b>';
+  }else if(connState==='connecting'){
+    cls='warn'; top='连接中…';
+    sub='正在连接 <code>wss://'+cfg.host+':'+cfg.port+'/mqtt</code> …';
+  }else if(connState==='failed'){
+    cls='bad'; top='MQTT 连接失败';
+    sub='<b>连不上 Broker。</b>'+(lastErr?('<br>错误：'+esc(lastErr)):'')+
+        '<br>依次检查：① 端口是否 <code>8084</code> ② 网络能否访问外网 ③ 换端口 <code>8083</code> 试试。'+
+        '<br>详见下方「原始报文」与浏览器 F12 控制台。';
+  }else if(connState==='connected'){
+    cls='ok'; top='MQTT 已连接';
+    sub='<b>已连接 Broker</b>（'+esc(cfg.host)+'）<br>正在订阅 <code>garden/'+esc(connDevId)+'/#</code>';
+    if(changed){
+      // 用户改了设备 ID 但还没重连: 这正是最容易误判成"设备掉线"的情形
+      cls='warn'; top='设备 ID 已改 · 待重连';
+      sub='<b>你刚把设备 ID 改成了 <code>'+esc(devId)+'</code>，但当前订阅的仍是 <code>'+
+          esc(connDevId)+'</code>。</b><br>请点上面的「连接」重新订阅。'+
+          '<br><span class="warn">在此之前，设备会一直显示离线（因为新主题下没有数据）。</span>';
+    }else if(!devOnline){
+      cls='warn';
+      sub+='<br><br><b class="warn">但该主题下还没有收到设备数据。</b>'+
+           '<br><span class="warn">若刚改过设备 ID，通常是因为 ESP32 还没重新烧录 —— '+
+           '固件里的 ID 是编译期常量，改了 config.h 不烧录不生效，设备仍往旧主题上报。</span>';
+    }
+  }
+  pill($('pMq'), cls, top);
+  var ss=$('setStatus');
+  if(ss){ ss.className='setstat'+(cls?' '+cls:''); ss.innerHTML=sub; }
+  updateBanner();     // ⭐ 状态一变就同步横幅（函数声明会提升, 放在后面定义没问题）
+}
+
+function setConn(state, err){
+  connState=state;
+  // ⭐ 不再因为"面板自己在重连"就立刻判设备离线（见 devOfflineTimer 的注释）
+  if(state==='connected'||state==='connecting') armDevGrace();
+  else devOnline=false;          // failed / noconf: broker 都连不上, 设备必然不可达
+  lastErr=err||'';
+  updateStatus();
+}
+
+/* ⭐ 宽限计时: 到点仍没收到 availability → 判设备离线 */
+function armDevGrace(){
+  cancelDevGrace();
+  devOfflineTimer=setTimeout(function(){
+    devOfflineTimer=0;
+    devOnline=false;
+    updateStatus();
+    render();
+  }, DEV_GRACE_MS);
+}
+function cancelDevGrace(){
+  if(devOfflineTimer){ clearTimeout(devOfflineTimer); devOfflineTimer=0; }
+}
+
+/* ⭐ 离线横幅 + 数据陈旧标记（每秒刷一次） */
+function updateBanner(){
+  var bar=$('offBar');
+  if(bar){
+    // 只有"面板自己连着、但设备没数据"才提示 —— 面板自己断开另有 MQTT 标签说明
+    if(!devOnline && connState==='connected'){
+      bar.className='offbar show';
+      bar.innerHTML='⚠ 设备离线'+(devStat.off>0?'（累计第 '+devStat.off+' 次）':'')+
+        '<span class="sub">离线期间发出的指令会被 broker 丢弃，点了很可能没反应 ✗'+
+        ' 请等设备恢复（顶部「设备在线」变绿）再操作。'+
+        '若一直不恢复，展开下方「原始报文」看最后一条 outputs 的时间。</span>';
+    }else{
+      bar.className='offbar';
+      bar.innerHTML='';
+    }
+  }
+  // 数据陈旧: 90 秒没有新报文 → 所有数值压暗, 表示"这些是旧数"
+  var age = lastDataAt ? (Date.now()-lastDataAt)/1000 : 1e9;
+  document.body.classList.toggle('stale', age>90);
+}
+
+/* ---------- 连接 ---------- */
+function connect(){
+  saveCfg();
+  if(!cfg.host||!cfg.dev){ setConn('noconf'); return; }
+  // MQTT 客户端库是异步加载的(多 CDN 回落): 没加载好就明确说出来, 别误报成"Broker 连不上"
+  if(typeof mqtt==='undefined'){
+    setConn('failed','MQTT 客户端库还没加载好（'+(window.__mqttLibState||'正在加载')+
+      '）。网络能通的 CDN 一到位会自动连接; 若一直如此, 请把 mqtt.min.js 下载到本文件同目录。');
+    return;
+  }
+  if(client){ try{client.end(true);}catch(e){} client=null; }
+  setConn('connecting');
+  try{
+    // 端口 8083 是非加密 ws, 其余按 wss; 路径可配置(EMQX Cloud 是 /mqtt)
+    var pth=cfg.path||'/mqtt'; if(pth.charAt(0)!=='/') pth='/'+pth;
+    var url=(String(cfg.port)==='8083'?'ws://':'wss://')+cfg.host+':'+cfg.port+pth;
+    var opt={clientId:'dash_'+Math.random().toString(16).slice(2,10),
+             keepalive:30,reconnectPeriod:5000,connectTimeout:8000,clean:true};
+    if(cfg.user) opt.username=cfg.user;          // 私有 Broker 认证
+    if(cfg.pass) opt.password=cfg.pass;
+    client=mqtt.connect(url,opt);
+  }catch(e){ setConn('failed','初始化失败: '+(e&&e.message?e.message:e)); return; }
+  client.on('connect',function(){
+    connDevId=cfg.dev;                 // 记住本次实际订阅的设备 ID
+    // ⭐ 这里原来还有一句 devOnline=false —— 这是**第二处**误报源头 ✗
+    //   面板每次重连成功都会走这里, 于是"设备离线"必然闪一下 ✗
+    //   改成走宽限: 8 秒内 retained 的 availability 会带回权威值 ✓
+    connState='connected'; lastErr='';
+    armDevGrace();
+    updateStatus();
+    client.subscribe(base()+'/#',{qos:0});
+  });
+  client.on('reconnect',function(){
+    // ⭐ 面板自己又发起了一次重连 —— 计数并显示, 用来判断"到底是谁在掉线" ✓
+    panelReconnects++;
+    showPanelReconnects();
+    logLine('conn','⚠ 面板与 broker 的连接中断，正在重连（累计第 '+panelReconnects+' 次）');
+    setConn('connecting');
+  });
+  client.on('close',function(){ setConn('failed','连接被关闭（网络中断或 Broker 拒绝）'); });
+  client.on('error',function(e){ setConn('failed',(e&&e.message)?e.message:String(e)); });
+  client.on('message',function(t,p){ onMsg(t,p.toString()); });
+}
+function disconnect(){
+  if(client){ try{client.end(true);}catch(e){} client=null; }
+  connDevId=''; devOnline=false;
+  setConn('idle');
+}
+$('btnConn').onclick=connect; $('btnDisc').onclick=disconnect; $('btnReconnect').onclick=connect;
+
+/* ---------- 收报文 → 快照 → 重绘 ---------- */
+// ⭐ 远程诊断渲染: 把设备发来的最近 10 条日志显示出来。
+//   排障思路: 点按钮 → 看这里有没有 "[MQTT] 收到" → 有没有 "[ACT] ... -> ON"
+function renderDiag(d){
+  var head=$('diagHead'), pre=$('diag');
+  if(!head||!pre) return;
+  if(!d||typeof d!=='object'){ head.textContent='— 诊断数据格式异常 —'; return; }
+  var mins=Math.floor((d.up||0)/60);
+  var sf=(d.subfail===undefined?0:d.subfail);
+  head.innerHTML='指令数 <b>'+(d.cmd===undefined?'-':d.cmd)+'</b>'+
+    ' · 连接失败 <b>'+(d.fail===undefined?'-':d.fail)+'</b>'+
+    // ⭐ 订阅失败 > 0 = 设备收不到指令（面板点了没反应），必须显眼
+    ' · 订阅失败 '+(sf>0
+        ?'<b style="color:var(--bad)">'+sf+' ⚠ 设备收不到指令</b>'
+        :'<b>0</b>')+
+    ' · 已运行 <b>'+mins+' 分钟</b>'+
+    ' · 日志溢出 <b>'+(d.lost===undefined?'-':d.lost)+'</b>'+
+    (connDevId?' · 订阅 <b>'+esc(connDevId)+'</b>':'');
+  var logs=(d.log&&d.log.length)?d.log:[];
+  pre.textContent = logs.length ? logs.join('\n') : '（设备还没产生日志）';
+
+  // ⭐⭐ 固件 1.2.6 新增的结构化字段 —— 这些是"设备自己数出来的真数字"，
+  //    比面板推断的更可靠（面板只能在它开着的时候数）✓
+  //    缺字段时显示 —，旧固件(1.2.4)就是这样，一眼能看出没烧新固件 ✓
+  var U32MAX=4294967295;
+  var rec  = (d.rec===undefined?'—':d.rec);
+  var wd   = (d.wd===undefined?'—':d.wd);
+  var wdr  = (d.wdr===undefined||d.wdr===0)?'':'（原因 <b>'+d.wdr+'</b>）';
+  var lcmd = (d.lcmd===undefined?'—':esc(String(d.lcmd)));
+  var lwant= (d.lwant===undefined?'—':(d.lwant?'开':'关'));
+  var lage = (d.lage===undefined||d.lage===U32MAX)?'—':(d.lage+' 秒前');
+  var lon  = (d.lon===undefined?'—':(d.lon?'开':'关'));
+  var lown = (d.lown===undefined?'—':(d.lown?'手动':'自动'));
+  var lleft= (d.lleft===undefined?'—':(d.lleft===U32MAX?'永不交还':(d.lleft+' 秒')));
+  if(d.rec!==undefined || d.lcmd!==undefined){
+    head.innerHTML+='<br>重连 <b'+(typeof rec==='number'&&rec>3?' style="color:var(--warn)"':'')+'>'+rec+'</b>'+
+      ' 次 · WiFi 掉线 <b'+(typeof wd==='number'&&wd>0?' style="color:var(--warn)"':'')+'>'+wd+'</b> 次'+wdr+
+      '<br>最后指令 <b>'+lcmd+' → '+lwant+'</b>'+(lage==='—'?'':'（'+lage+'）')+
+      '<br>增氧 <b>'+lon+'</b> · '+lown+(lleft==='—'?'':' · 手动剩余 '+lleft)+
+      (d.lrsn?(' · 原因 <b>'+esc(String(d.lrsn))+'</b>'):'');
+  }
+}
+
+function onMsg(topic,text){
+  lastDataAt=Date.now();
+  logLine(topic,text);
+  var sub=topic.slice(base().length+1);
+  var d; try{ d=JSON.parse(text); }catch(e){ d=text; }
+
+  if(sub==='availability'){
+    var nowOn=(String(text).trim()==='online');
+    // ⭐ 只在 online→offline 的**转变**时计数（retained 会重复投递，盲目 +1 会重复计数）
+    if(devOnline && !nowOn){
+      devStat.off++;
+      devStat.lastOffAt=Date.now();
+      devStatSave(); showDevStat();
+      logLine('conn','📴 设备掉线 —— 累计第 '+devStat.off+' 次');
+    }else if(!devOnline && nowOn && devStat.lastOffAt){
+      var sec=Math.round((Date.now()-devStat.lastOffAt)/1000);
+      if(sec>=0 && sec<86400) devStat.offTotalS+=sec;   // 超过一天的不计(多半是面板关了)
+      devStat.lastOffAt=0;
+      devStatSave(); showDevStat();
+      logLine('conn','📶 设备恢复在线 —— 这次离线约 '+sec+' 秒，累计离线 '+devStat.offTotalS+' 秒');
+    }
+    devOnline=nowOn;
+    cancelDevGrace();        // ⭐ 收到设备的权威答复, 取消宽限计时
+    pill($('pDev'),devOnline?'ok':'bad',devOnline?'设备在线':'设备离线');
+    updateStatus();
+    return;
+  }
+  // ⭐ 远程诊断: 只更新那块折叠区，不触发整页重绘
+  if(sub==='diag'){
+    renderDiag(d);
+    return;
+  }
+  // ⭐⭐ 2026-10-29: 只在"状态真的变成期望值"时才清 pending ✗
+  //
+  //   原来: 收到任何 outputs 报文就 delete pending[o.id] —— 哪怕 o.on 还是旧值。
+  //   现场后果(浇水 C 区): 点「开」→ 设备还没执行(或指令还没到) → 但 30 秒周期
+  //   或别的输出变化触发的 outputs 先把 pending 清掉了 → 按钮提前"恢复"、
+  //   停止重试 → 状态却还是「关」→ 用户看到"3 秒按键恢复，7 秒才变，闹鬼"✗
+  //
+  //   现在: 只有 on === 期望值 才清 pending, 否则让 markPending 的定时器继续
+  //   重发/超时, 行为才和 A/B 一致 ✓
+  if(sub==='outputs'){
+    outputs={};
+    (d.outputs||[]).forEach(function(o){
+      outputs[o.id]=o;
+      if(!pending[o.id]) return;                     // 本来就没在等
+      var want=pendingWant[o.id];                    // true=期望开, false=期望关
+      if(want===undefined || !!o.on===want) delete pending[o.id];
+    });
+    d={outputs:outputs};
+  }
+  var changed=(JSON.stringify(S[sub])!==JSON.stringify(d));   // 相同则跳过重绘, 省掉每 30 秒的无谓刷新
+  S[sub]=d;
+  if(sub==='config') onCfgMsg();
+  if(changed){
+    render();
+    // config 决定参数面板的值; zones 决定面板里出现几个区域的行, 两者都要刷新面板
+    if(sub==='config'||sub==='zones') renderCfg();
+  }
+}
+
+/* ---------- 新鲜度 ---------- */
+setInterval(function(){
+  updateBanner();   // ⭐ 横幅与"数据陈旧"每秒刷新（必须在下面早退之前，否则离线时不会刷新）
+  if(!lastDataAt){ pill($('pAge'),'','无数据'); return; }
+  var s=Math.round((Date.now()-lastDataAt)/1000);
+  pill($('pAge'), s<70?'ok':(s<180?'warn':'bad'),
+       s<2?'刚刚更新':('更新于 '+s+' 秒前'));
+},1000);
+
+/* ---------- 工具 ---------- */
+function num(v,u,dg,badText){
+  if(v===undefined||v===null||v<0) return '<span style="color:var(--bad)">'+(badText||'--')+'</span>';
+  return v.toFixed(dg===undefined?1:dg)+'<small>'+u+'</small>';
+}
+function esc(s){ return String(s===undefined?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+/* ==========================================================================
+   参数设置面板
+   --------------------------------------------------------------------------
+   字段名与固件 mqtt_link.cpp 的 _handleSettingsCmd() 一一对应, 不要随意改。
+   每个字段: key 为下发的扁平键名; 土壤类字段由 makeCfgSchema() 按当前区域数生成,
+   因此把 SOIL_ZONE_COUNT 改成 3 时, 面板会自动多出区域 C 的一行。
+   取值在设备端还会被再次钳制, 这里显示的 min/max 只是提示。
+   ========================================================================== */
+function makeCfgSchema(){
+  var g=[];
+  var soilFields=[];
+  // 按当前设备上报的区域数生成; 若还没收到 zones 报文, 按 3 路兜底(当前接线 A/B/C)
+  var zn=(S.zones&&S.zones.zones)?S.zones.zones:[];
+  var n=zn.length||3;
+  for(var i=0;i<n;i++){
+    var L=String.fromCharCode(65+i).toLowerCase();
+    var nm=(zn[i]&&zn[i].name)||('区域 '+String.fromCharCode(65+i));
+    soilFields.push({key:'soil_'+L+'_low', label:nm+' 浇水下限', unit:'% · 低于此值开始浇水', min:0, max:95, dg:0});
+    soilFields.push({key:'soil_'+L+'_high',label:nm+' 浇水上限', unit:'% · 达到此值停止浇水', min:5, max:100, dg:0});
+  }
+  g.push({id:'g_soil', title:'浇水阈值', fields:soilFields});
+  g.push({id:'g_pump', title:'共享水泵（现场只有一套泵，同一时刻只浇一路）', fields:[
+    {key:'water_priority', label:'多路都旱时先浇哪一路', unit:'0=按区域顺序(A→B→C)  1=最干的先浇  2=轮流', min:0, max:2, dg:0},
+    {key:'water_zone_count', label:'启用浇水的区域数', unit:'1~3 · 后面的区域只检测不浇水　三路都用就填 3（共享泵保证同时只有一路开阀）', min:1, max:3, dg:0},
+    {key:'manual_water',   label:'浇水手动模式',       unit:'关 = 按规则自动　开 = 规则完全不介入，只手动', bool:true}
+  ]});
+  g.push({id:'g_level', title:'水箱水位（超声波：数值越大水位越低，下限必须大于上限）', fields:[
+    // ⭐ 水箱深度: 它会把两条水位线**钳制**到不超过它 ✗
+    //   所以想设 50/40，深度必须 ≥ 50（默认 100）✓
+    {key:'tank_depth_cm', label:'水箱深度（探头面→箱底）', unit:'cm · 两条水位线不会超过它', min:10, max:500, dg:0},
+    {key:'level_low_cm',  label:'下水位线（开始补水）', unit:'cm', min:5,  max:500, dg:0},
+    {key:'level_high_cm', label:'上水位线（停止补水）', unit:'cm', min:2,  max:495, dg:0},
+    {key:'water_protect', label:'水源水位保护',        unit:'开 = 水位过低/读数无效时禁止浇水（推荐）　关 = 不检查（调试用）', bool:true},
+    {key:'water_hard_stop', label:'水位低强制停机',    unit:'开 = 水位低时连手动也拒绝（推荐）　关 = 手动仍可浇，风险自负', bool:true}
+  ]});
+  g.push({id:'g_rain', title:'降雨判定', fields:[
+    {key:'wx_enable',      label:'网络气象判雨',     unit:'关 / 开（需求4）', bool:true},
+    {key:'wx_rain_prob',   label:'降雨概率阈值',     unit:'% · 达到即判为雨天', min:0, max:100, dg:0},
+    {key:'wx_lock_hours',  label:'气象判雨锁定时长', unit:'小时', min:0, max:72, dg:1},
+    {key:'air_temp_warn',  label:'高温预警阈值',     unit:'°C · 只告警，不浇水', min:5, max:60, dg:0},
+    {key:'air_humid_rain', label:'空气高湿阈值',     unit:'% · 与「全部区域土壤高湿」共同判雨', min:50, max:100, dg:0},
+    {key:'rain_lock_hours',label:'本地判雨锁定时长', unit:'小时（需求3 的 X）', min:0, max:72, dg:1}
+  ]});
+  // 照明口(GPIO4)现场已经改接成 220V 增氧泵, 所以原来那组"照明"参数由下面的
+  // 「增氧泵」组取代; 固件里旧的 _controlLight()/light_auto 不再使用。
+  // (该路现在由 rule_engine.cpp 的 _controlOxygen() 负责: 窗口内定时, 窗口外常闭。)
+  g.push({id:'g_feed', title:'自动喂鱼（走预留输出 1，接喂食器继电器）', fields:[
+    {key:'feed_enable', label:'自动投喂',         unit:'关 / 开', bool:true},
+    {key:'feed_hour_1', label:'第 1 次投喂 · 时', unit:'0–23 时（默认 7 = 早上 7 点）', min:0, max:23, dg:0},
+    {key:'feed_min_1',  label:'第 1 次投喂 · 分', unit:'0–59 分', min:0, max:59, dg:0},
+    {key:'feed_hour_2', label:'第 2 次投喂 · 时', unit:'0–23 时（默认 19 = 晚上 7 点）', min:0, max:23, dg:0},
+    {key:'feed_min_2',  label:'第 2 次投喂 · 分', unit:'0–59 分', min:0, max:59, dg:0},
+    {key:'feed_sec',    label:'每次闭合时长',     unit:'秒 · 一次"通断"继电器闭合多久', min:1, max:60, dg:0}
+  ]});
+  g.push({id:'g_oxy', title:'增氧泵（继电器 GPIO4）· 定时增氧', fields:[
+    {key:'oxygen_auto',  label:'启用自动计划',   unit:'关 = 纯手动开/关　·　开 = 按下面时段与次数自动启停', bool:true},
+    {key:'oxy_on_hour',  label:'时段开始 · 时', unit:'0–23 时（默认 6 = 早上 6 点）', min:0, max:23, dg:0},
+    {key:'oxy_on_min',   label:'时段开始 · 分', unit:'0–59 分（默认 0）', min:0, max:59, dg:0},
+    {key:'oxy_off_hour', label:'时段结束 · 时', unit:'0–23 时（默认 22 = 晚上 10 点）', min:0, max:23, dg:0},
+    {key:'oxy_off_min',  label:'时段结束 · 分', unit:'0–59 分（默认 0）', min:0, max:59, dg:0},
+    {key:'oxy_times',    label:'每天增氧次数',   unit:'次 · 时段内均匀排开（1–12，默认 4）', min:1, max:12, dg:0},
+    {key:'oxy_dur_min',  label:'每次增氧时长',   unit:'分钟（1–720，默认 30）', min:1, max:720, dg:0}
+  ]});
+  g.push({id:'g_safe', title:'安全上限与手动超时', fields:[
+    // ⭐ 手动保持时长上限 900 秒(15 分钟): 目的是"防遗忘" —— 测电平/验功能/手工换水
+    //   都够用，忘了关也会自动交还规则引擎。固件侧还有同值的硬上限(MANUAL_MAX_SEC)兜底，
+    //   所以这里填再大也不会超过 15 分钟。
+    {key:'manual_timeout_s', label:'手动指令保持时长', unit:'秒 · 到点自动交还（上限 900=15分）', min:60, max:900, dg:0},
+    {key:'water_max_s',      label:'自动浇水单次上限',  unit:'秒 · 只影响自动浇水（手动统一 900=15分）', min:30, max:3600, dg:0},
+    {key:'refill_max_s',     label:'单次最长补水',     unit:'秒（自动补水的分次节奏）', min:30, max:7200, dg:0}
+  ]});
+  return g;
+}
+
+var cfgVals={}, cfgOrig={}, cfgDirty={}, cfgPendingKeys={};
+
+/* 从设备上报的 config 报文里取值(结构: {"settings":{...}}) */
+function valFromConfig(key){
+  var st=(S.config&&S.config.settings)?S.config.settings:null;
+  if(!st) return null;
+  var v=st[key];
+  return (v===undefined||v===null)?null:v;
+}
+
+function renderCfg(){
+  var box=$('cfgBody'); if(!box) return;
+
+  // 记住当前焦点字段: 重建 DOM 会把用户正在输入的光标顶掉
+  var focusKey=null, caret=null;
+  var ae=document.activeElement;
+  if(ae && ae.getAttribute && ae.getAttribute('data-cfg')){
+    focusKey=ae.getAttribute('data-cfg');
+    try{ caret=ae.selectionStart; }catch(e){ caret=null; }
+  }
+
+  var have=!!(S.config&&S.config.settings);
+  var html='';
+
+  if(!have){
+    html+='<p class="hint" style="color:var(--warn)">'+
+      '<b>尚未收到设备参数。</b>下方显示的是出厂默认值，仅作参考。<br>'+
+      '请先连接设备；设备上报 <code>config</code> 报文后会自动刷新为真实值。</p>';
+  }
+
+  var editable=have;
+  makeCfgSchema().forEach(function(g){
+    html+='<div class="cfggrp" data-grp="'+g.id+'"><div class="ct">'+esc(g.title)+'</div>';
+    g.fields.forEach(function(f){
+      var v=cfgVals[f.key];
+      if(v===undefined || v===null) v=(f.bool?false:(f.min!==undefined?f.min:''));
+      var cls=cfgDirty[f.key]?' class="dirty"':'';
+      var input;
+      if(f.bool){
+        input='<select data-cfg="'+f.key+'"'+cls+(editable?'':' disabled')+'>'+
+          '<option value="1"'+(v?' selected':'')+'>开</option>'+
+          '<option value="0"'+(!v?' selected':'')+'>关</option></select>';
+      }else{
+        var shown=(typeof v==='number')?v.toFixed(f.dg||0):v;
+        input='<input type="number" data-cfg="'+f.key+'"'+cls+
+          (f.min!==undefined?(' min="'+f.min+'"'):'')+
+          (f.max!==undefined?(' max="'+f.max+'"'):'')+
+          ' step="'+(f.dg>=1?'0.5':(f.dg?'0.01':'1'))+'"'+
+          ' value="'+esc(shown)+'"'+(editable?'':' disabled')+'>';
+      }
+      html+='<div class="cfgrow"><div class="cl">'+esc(f.label)+
+        (f.unit?'<span class="cu">'+esc(f.unit)+'</span>':'')+
+        '</div><div>'+input+'</div></div>';
+    });
+    html+='</div>';
+  });
+
+  box.innerHTML=html;
+
+  // 恢复焦点与光标位置
+  if(focusKey){
+    var again=box.querySelector('[data-cfg="'+focusKey+'"]');
+    if(again){
+      try{
+        again.focus();
+        if(caret!==null && again.setSelectionRange) again.setSelectionRange(caret,caret);
+      }catch(e){}
+    }
+  }
+  updateCfgStatus();
+}
+
+/* ⭐ 参数快照导出 —— 换芯片前必备 ✓
+   新板 NVS 是空的, 所有运行期参数会回到编译期默认值。
+   最危险的一条: levelLowCm 现场 51 → 默认 85, 自动补水直接失效 ✗
+   所以换板前导出一份可复制的清单, 换完逐项对照改回去 ✓ */
+function dumpCfgSnapshot(){
+  var st=(S.config&&S.config.settings)?S.config.settings:null;
+  var L=[];
+  var d=new Date();
+  L.push('# 我家小院 参数快照');
+  L.push('# 时间: '+d.toLocaleString('zh-CN'));
+  L.push('# 设备: '+((S.state&&S.state.id)||devIdNow()||'?'));
+  L.push('# 固件: '+((S.state&&S.state.fw)||'?'));
+  L.push('# 说明: 换芯片后新板参数会回到出厂默认, 按本清单改回');
+  L.push('');
+  if(!st){
+    L.push('!!!! 尚未收到设备的 config 报文 !!!!');
+    L.push('下面的值是出厂默认, 不能当作现场真实值 ✗');
+    L.push('请先连接设备, 等收到 config 报文后再导出');
+    L.push('');
+  }
+  makeCfgSchema().forEach(function(g){
+    L.push('## '+g.title);
+    g.fields.forEach(function(f){
+      var v=null;
+      if(st && st[f.key]!==undefined && st[f.key]!==null) v=st[f.key];
+      else if(cfgVals[f.key]!==undefined && cfgVals[f.key]!==null) v=cfgVals[f.key];
+      if(v===null) return;
+      var shown=f.bool?(v?'开':'关'):v;
+      L.push('  '+f.key+' = '+shown+(f.unit?(' '+f.unit):''));
+    });
+    L.push('');
+  });
+  if(st){
+    L.push('## 原始 JSON（设备实际下发值，可逐字核对）');
+    try{ L.push(JSON.stringify(st)); }catch(e){ L.push('(序列化失败)'); }
+  }
+  var ta=$('dumpText'), ov=$('dumpBox');
+  if(!ta||!ov){ return; }
+  ta.value=L.join('\n');
+  ov.classList.add('show');
+  try{ ta.focus(); }catch(e){}
+}
+
+function copyDump(){
+  var ta=$('dumpText'); if(!ta) return;
+  ta.focus(); ta.select();
+  var ok=false;
+  try{ ok=document.execCommand('copy'); }catch(e){ ok=false; }
+  if(!ok && navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(ta.value).then(function(){
+      if(typeof logLine==='function') logLine('conn','✅ 参数快照已复制到剪贴板');
+    },function(){
+      if(typeof logLine==='function') logLine('conn','⚠ 复制失败，请长按文本框手动复制');
+    });
+    return;
+  }
+  if(typeof logLine==='function'){
+    logLine('conn', ok?'✅ 参数快照已复制到剪贴板':'⚠ 复制失败，请长按文本框手动复制');
+  }
+}
+
+/* ⭐ 从快照文本恢复参数 —— 换芯片后的关键一步 ✓
+   输入: 之前导出的快照(可含说明行), 也能吃纯 JSON
+   处理:
+     1) 先找能 JSON.parse 的 {...} 行（导出的最后一行就是设备原始值，最准）
+     2) 找不到就退回解析 "key = value" 行
+     3) 只填**表单**，标成"未保存"
+     4) ⚠ 不自动下发 —— 必须用户再点「保存到设备」，避免误改设备 ✓ */
+function restoreCfgFromText(){
+  var ta=$('dumpText'); if(!ta) return;
+  var txt=ta.value||'';
+  if(!txt.trim()){
+    alert('文本框是空的。\n\n请先粘贴之前导出的参数快照，或点「填入当前参数」看格式。');
+    return;
+  }
+
+  // ① 优先: 找可解析的 JSON 行（从后往前, 导出时它在最后）
+  var lines=txt.split(/\r?\n/), obj=null, src='';
+  for(var i=lines.length-1; i>=0; i--){
+    var s=lines[i].trim();
+    if(!s || s.charAt(0)!=='{') continue;
+    try{
+      var o=JSON.parse(s);
+      if(o && typeof o==='object' && !(o instanceof Array)){ obj=o; src='JSON'; break; }
+    }catch(e){ /* 不是 JSON, 继续往前找 */ }
+  }
+
+  // ② 退路: 解析 "key = value" 行
+  if(!obj){
+    var o2={}, n2=0, re=/^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$/;
+    lines.forEach(function(ln){
+      var m=ln.match(re); if(!m) return;
+      var k=m[1], raw=m[2];
+      if(raw==='开'){ o2[k]=true; n2++; return; }
+      if(raw==='关'){ o2[k]=false; n2++; return; }
+      var num=parseFloat(raw.split(/\s+/)[0]);
+      if(!isNaN(num)){ o2[k]=num; n2++; }
+    });
+    if(n2){ obj=o2; src='key=value'; }
+  }
+
+  if(!obj){
+    alert('没在文本里找到可识别的参数。\n\n'+
+      '需要满足其一:\n'+
+      '· 含一行完整的 JSON（以 { 开头）\n'+
+      '· 或者是 "levelLowCm = 51" 这种一行一项的格式');
+    return;
+  }
+
+  // ③ 按面板的 schema 过滤，只认认识的字段
+  var schema={};
+  makeCfgSchema().forEach(function(g){
+    g.fields.forEach(function(f){ schema[f.key]=f; });
+  });
+  var apply={}, unknown=[], changed=[];
+  Object.keys(obj).forEach(function(k){
+    if(!schema[k]){ unknown.push(k); return; }
+    var f=schema[k], v=obj[k];
+    if(f.bool){
+      v=(v===true||v===1||v==='1'||v==='开'||v==='true');
+    }else{
+      v=parseFloat(v);
+      if(isNaN(v)) return;
+    }
+    apply[k]=v;
+    var cur=cfgOrig[k];
+    if(cur===undefined || String(cur)!==String(v)) changed.push(k);
+  });
+
+  if(!Object.keys(apply).length){
+    alert('文本里的字段名都对不上当前固件。\n\n可能不是同一个版本的快照，或解析格式不对。');
+    return;
+  }
+
+  // ④ 让用户确认（列出前几项"旧 → 新"）
+  var msg='从快照恢复 '+Object.keys(apply).length+' 项参数（来源: '+src+'）\n\n';
+  if(changed.length){
+    msg+='会改动 '+changed.length+' 项，例如:\n';
+    changed.slice(0,8).forEach(function(k){
+      var cur=(cfgOrig[k]===undefined)?'(无)':cfgOrig[k];
+      msg+='   '+k+': '+cur+' → '+apply[k]+'\n';
+    });
+    if(changed.length>8) msg+='   …还有 '+(changed.length-8)+' 项\n';
+  }else{
+    msg+='和当前设备的值完全一致，不需要改动。\n';
+  }
+  if(unknown.length) msg+='\n忽略不认识的字段: '+unknown.join(', ')+'\n';
+  msg+='\n注意: 只是填进表单，**不会立刻下发**。\n填好后还要点「保存到设备」。\n\n继续？';
+  if(typeof confirm==='function' && !confirm(msg)) return;
+
+  // ⑤ 写入表单状态，标为未保存
+  Object.keys(apply).forEach(function(k){
+    cfgVals[k]=apply[k];
+    if(cfgOrig[k]!==undefined && String(cfgOrig[k])===String(apply[k])) delete cfgDirty[k];
+    else cfgDirty[k]=1;
+  });
+  renderCfg();
+  var ov=$('dumpBox'); if(ov) ov.classList.remove('show');
+  var cp=$('cfgPanel'); if(cp) cp.open=true;
+  updateCfgStatus();
+  if(typeof logLine==='function'){
+    logLine('cfg','📥 已从快照填入 '+Object.keys(apply).length+' 项（待保存）');
+  }
+}
+
+/* 把当前参数重新生成到文本框（浮层里的「填入当前参数」） */
+function fillCfgSnapshot(){
+  dumpCfgSnapshot();
+  var cp=$('cfgPanel'); /* 保持浮层在最上层, 只重填内容 */
+  void cp;
+}
+
+/* ⭐ 页面上的「恢复参数」按钮: 打开浮层、清空文本、光标就位 ✓
+   比让用户先点「导出参数」再找弹窗里的按钮直观得多 */
+function openRestoreBox(){
+  var ta=$('dumpText'), ov=$('dumpBox');
+  if(!ta||!ov){
+    alert('找不到恢复窗口。请强制刷新页面（Ctrl+F5）后重试。');
+    return;
+  }
+  ta.value='';
+  ta.placeholder='把之前导出的参数快照粘贴到这里，再点下面的「从文本恢复」。';
+  ov.classList.add('show');
+  try{ ta.focus(); }catch(e){}
+}
+
+/* ⭐ 下载成 .txt 文件 —— 比"复制长文本"可靠得多 ✓
+   为什么需要: 微信里复制长文本常被折叠/截断 ✗
+   走文件就没有这个问题, 传到哪台电脑都能原样打开 ✓ */
+function downloadCfgSnapshot(){
+  var ta=$('dumpText');
+  if(!ta){ return; }
+  if(!(ta.value||'').trim()){ dumpCfgSnapshot(); ta=$('dumpText'); }
+  var txt=(ta&&ta.value)||'';
+  if(!txt.trim()){ alert('没有可导出的内容。请先连上设备、收到 config 报文。'); return; }
+
+  var dev=(S.state&&S.state.id)||devIdNow()||'garden';
+  var dstr=new Date().toISOString().slice(0,10).replace(/-/g,'');
+  var name='params-'+dev+'-'+dstr+'.txt';
+  try{
+    var blob=new Blob([txt], {type:'text/plain;charset=utf-8'});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement('a');
+    a.href=url; a.download=name; a.style.display='none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function(){
+      try{ document.body.removeChild(a); }catch(e){}
+      URL.revokeObjectURL(url);
+    }, 1500);
+    if(typeof logLine==='function') logLine('cfg','💾 已下载参数快照 '+name);
+  }catch(e){
+    alert('下载失败（浏览器限制）。\n\n请改用「复制全部」或长按文本框手动复制。');
+  }
+}
+
+function updateCfgStatus(){
+  var el=$('cfgStatus'); if(!el) return;
+  var n=Object.keys(cfgDirty).length;
+  var np=Object.keys(cfgPendingKeys).length;
+  if(np){ el.className='cs'; el.innerHTML='已下发 '+np+' 项，等待设备确认…'; return; }
+  if(n){ el.className='cs warn'; el.innerHTML='<b>有 '+n+' 项改动未保存。</b>点右侧「保存到设备」下发。'; return; }
+  el.className='cs';
+  el.innerHTML = (S.config&&S.config.settings)
+    ? '当前显示设备实际参数，无未保存改动。'
+    : '连接设备后会自动载入当前参数。';
+}
+
+function onCfgEdit(el){
+  var k=el.getAttribute('data-cfg'); if(!k) return;
+  var raw=(el.tagName==='SELECT') ? el.value : el.value.trim();
+  var val;
+  if(el.tagName==='SELECT'){ val=(raw==='1'||raw==='true'); }
+  else{
+    if(raw===''){ delete cfgDirty[k]; renderCfg(); return; }
+    val=parseFloat(raw);
+    if(isNaN(val)){ delete cfgDirty[k]; renderCfg(); return; }
+  }
+  cfgVals[k]=val;
+  if(cfgOrig[k]!==undefined && cfgOrig[k]===val) delete cfgDirty[k];
+  else cfgDirty[k]=1;
+  updateCfgStatus();
+}
+
+function saveCfgToDevice(){
+  var keys=Object.keys(cfgDirty);
+  if(!keys.length){ updateCfgStatus(); return; }
+  if(!client||!client.connected){
+    var el=$('cfgStatus');
+    el.className='cs bad';
+    el.innerHTML='<b>尚未连接设备，无法下发。</b>';
+    return;
+  }
+  var s={};
+  keys.forEach(function(k){ s[k]=cfgVals[k]; });
+  // 一次性批量下发: 固件支持只发改动的字段, 其余保持不变
+  // QoS 1: 参数是"设置了就希望一定生效", 丢了会让人以为设置没起作用。
+  var topic=base()+'/cmd/settings', pl=JSON.stringify({settings:s});
+  // ⭐ 把"下发的参数"也记日志 —— 以前发失败完全看不见，只会觉得"改了没生效" ✗
+  logLine('cfg','📤 下发参数 '+pl);
+  client.publish(topic, pl, {qos:1}, function(err){
+    if(err){
+      logLine('cfg','❌ 参数下发失败: '+(err&&err.message?err.message:err)+
+        ' —— 设备收不到，设置不会生效');
+      var el=$('cfgStatus');
+      if(el){ el.className='cs bad'; el.innerHTML='<b>参数下发失败（网络/权限）</b>，请检查连接后重试。'; }
+    }else{
+      logLine('cfg','✅ broker 已确认收到参数 —— 若设备仍显示旧值，说明固件把它钳制/纠正了'+
+        '（例如超出「水箱深度」或 下限≤上限）');
+    }
+  });
+  cfgPendingKeys={};
+  keys.forEach(function(k){ cfgPendingKeys[k]=1; });
+  cfgDirty={};
+  renderCfg();
+  setTimeout(function(){
+    if(Object.keys(cfgPendingKeys).length){ cfgPendingKeys={}; updateCfgStatus(); }
+  },10000);
+}
+
+function onCfgMsg(){
+  // 用设备真实值刷新, 并清掉"等待确认"
+  var schema=makeCfgSchema(), keys=[];
+  schema.forEach(function(g){ g.fields.forEach(function(f){ keys.push(f.key); }); });
+  keys.forEach(function(k){
+    var v=valFromConfig(k);
+    if(v===null) return;
+    var isBool=(typeof v==='boolean');
+    var num=isBool?null:parseFloat(v);
+    cfgVals[k]=isBool?v:num;
+    cfgOrig[k]=isBool?v:num;
+  });
+  cfgPendingKeys={};
+  renderCfg();
+}
+
+/* ⭐ 卡片标题栏的「读数」按钮
+   发 cmd/read / <target> → 固件对**这一路**强制采集一次(不碰气象),
+   600ms 后补发一帧, 卡片上的数值就刷新了。
+   target: soil_a / soil_b / soil_c / water / air */
+function readBtn(target,label){
+  return '<button class="rd" data-read="'+target+'" '+
+         'title="立刻采一次这一路的实时数据（不等采样周期）">'+
+         (label||'读数')+'</button>';
+}
+
+/* 生成模块外壳 */
+function mod(block,icon,title,statusHtml,statusCls,bodyHtml,opsHtml,wide,headExtra){
+  return '<div class="mod'+(wide?' wide':'')+(statusCls==='bad'?' off':'')+'" data-block="'+block+'">'+
+    '<div class="mod-h"><span class="ic">'+icon+'</span><span class="nm">'+title+'</span>'+
+      '<span class="st '+(statusCls||'')+'">'+statusHtml+'</span>'+
+      (headExtra||'')+          /* ⭐ 标题栏最右侧的自定义按钮(如「读数」) */
+    '</div>'+
+    /* ⚠ 上面这个 </div> 绝对不能少: 少了它 .mod-b 会被塞进 .mod-h 里,
+       而 .mod-h 是 display:flex 横排 → 整个卡片内容被挤成一行、全部跑到左边 ✗ */
+    '<div class="mod-b">'+bodyHtml+
+      (opsHtml?'<div class="ops">'+opsHtml+'</div>':'')+
+    '</div></div>';
+}
+
+/* ⭐ 纯土壤节点（车库花坛 garden-lab）的卡片
+   ------------------------------------------------------------------
+   问题: 这台设备**不上报 zones**（它没有任何浇水阀/阈值/状态机），
+        而上面的区域卡片是遍历 zn.zones 画出来的 → 数组为空 → 一张都不画
+        → 切过去整页空着，看不到土壤湿度 ✗
+
+   做法: 只要 zones 为空、但 sensors 里有 soil_*，就按**实际存在的探头**
+        逐个画卡片。没有阈值就**不画下限/上限刻度**（那台设备不下发 config，
+        画出来的刻度是编的，会误导）；只显示: 湿度% + 原始ADC + 电压 + 进度条 ✓
+   ------------------------------------------------------------------ */
+function soilOnlyHtml(sen){
+  var out='';
+  ['a','b','c'].forEach(function(L){
+    var s=sen['soil_'+L];
+    if(!s) return;                                  // 这台设备没有这一路，跳过
+    var pct=(typeof s.pct==='number')?s.pct:null;
+    var ok=!!s.valid && pct!==null && pct>=0;
+    var body='';
+    if(ok){
+      // ⚠ 电压只显示**一个**: 土壤节点会额外上报实测 mv，它比"raw 换算值"可信
+      //   (换算假设 3.3V 满量程，实际有偏差)。两个都画会出现
+      //   "1.94 V / 1.94 V 实测" 这种重复，看着像 bug ✗
+      var voltTxt;
+      if(typeof s.mv==='number' && s.mv>0){
+        voltTxt=(s.mv/1000).toFixed(2)+' V<span style="opacity:.7"> 实测</span>';
+      }else if(typeof s.raw==='number'){
+        voltTxt=(s.raw*3.3/4095).toFixed(2)+' V';
+      }else{
+        voltTxt='—';
+      }
+      body+='<div class="main-val"><div class="num">'+pct.toFixed(1)+'<small>%</small></div>'+
+            '<div class="side">原始值 '+(s.raw===undefined?'-':s.raw)+'<br>'+voltTxt+'</div></div>';
+      body+='<div class="track"><i style="width:'+Math.max(2,Math.min(100,pct))+'%"></i></div>';
+      body+='<div class="scale"><span>0%</span><span>100%</span></div>';
+      body+='<div class="reason">当前：<b>土壤湿度 '+pct.toFixed(1)+'%</b></div>';
+    }else{
+      var rawTxt=(s.raw===undefined)?'—':s.raw;
+      var rawNum=(typeof s.raw==='number')?s.raw:null;
+      var guess='读数无效';
+      if(rawNum!==null && rawNum<=50)        guess='原始值 ≈0：探头没接 / 线断了 / 短路到 GND';
+      else if(rawNum!==null && rawNum>=4040) guess='原始值 ≈4095：探头短路到 3V3';
+      else if(pct!==null && pct<0)           guess='固件判定读数超出标定区间 —— 需要在主控网页里重标（soilAdcDry / soilAdcWet）';
+      body+='<div class="main-val"><div class="num bad">读数无效</div>'+
+            '<div class="side">原始值 '+rawTxt+'</div></div>';
+      body+='<p class="hint">'+guess+'</p>';
+    }
+    // ⭐ 把"这个百分比是按哪两个点算出来的"写出来 —— 否则数字偏了没法判断
+    //   到底是土壤的问题还是标定没做/做错了（固件 0.2.0 起才上报这两个字段）
+    if(typeof s.dry_mv==='number' && typeof s.wet_mv==='number'){
+      body+='<div class="reason">标定：<b>干 '+s.dry_mv+' mV → 0%</b>'+
+            ' &nbsp;·&nbsp; <b>湿 '+s.wet_mv+' mV → 100%</b></div>';
+    }
+    out+=mod('soil'+L,'🌿','土壤 '+L.toUpperCase(),
+             ok?('湿度 '+pct.toFixed(1)+'%'):'读数无效', ok?'':'bad',
+             body,'',false, readBtn('soil_'+L));
+  });
+  return out;
+}
+
+/* 输出开关按钮组 */
+function opsFor(ids){
+  // ⭐ 共享水泵: 找出"此刻正在浇的那一路"的名字, 好让被压住的卡片说清楚在等谁 ✓
+  //   (原来只写"另一路在浇", 三路都在用的时候不知道到底是哪一路 ✗)
+  var busyZone=null;
+  ['water_a','water_b','water_c'].forEach(function(k){
+    if(outputs[k] && outputs[k].on) busyZone=k;
+  });
+  var busyName = busyZone ? (NAME[busyZone]||busyZone) : '另一路';
+  return ids.map(function(id){
+    var o=outputs[id]||{}, manual=(o.owner==='manual'), busy=pending[id];
+    // 共享水泵互锁: 另一路正在浇水时本路被压住(连手动也开不了)。
+    // 必须显示出来 —— 否则按了没反应, 会以为面板坏了。
+    // ⭐ 仅在"本路没开"时才算锁定(自己开着就是它占着泵, 不该禁用自己)
+    var locked=!!o.interlocked && !o.on;
+    var left=null;
+    if(manual && o.manual_left_s!==undefined) left=Math.max(0,Math.round(o.manual_left_s));
+    // ⭐ 剩余时间显示: 超过 1 小时的用"小时"表示(手动补水可能选"不限时"=24 小时,
+    //   否则会显示成"1440 分 00 秒"这种怪数字)。
+    var cnt='';
+    if(left!==null){
+      if(left>=3600)      cnt=' · '+Math.floor(left/3600)+' 小时 '+Math.floor((left%3600)/60)+' 分';
+      else if(left>=60)   cnt=' · '+Math.floor(left/60)+' 分 '+String(left%60).padStart(2,'0')+' 秒';
+      else                cnt=' · '+left+' 秒';
+    }
+    return '<button class="pri'+(o.on?' on':'')+(busy||locked?' busy':'')+'" data-tog="'+id+'"'+
+      (busy||locked?' disabled':'')+
+      '>'+(NAME[id]||id)+(busy?' …':(o.on?' 已开':' 已关'))+
+      (locked?' <span class="tag manual">'+busyName+'在浇</span>'
+             :(manual?' <span class="tag manual">手动'+cnt+'</span>':' <span class="tag auto">自动</span>'))+'</button>'+
+      (manual?'<button class="gh" data-auto="'+id+'">恢复自动</button>':'');
+  }).join('');
+}
+
+/* 纯手动开关(照明用): 只有开/关两种动作。
+   不显示手动/自动标签, 也不给"恢复自动" —— 照明不参与任何自动规则,
+   这一路上"自动"这个说法本身没有意义。 */
+function opsManualOnly(id,onLabel,offLabel){
+  var o=outputs[id]||{}, busy=pending[id];
+  return '<button class="pri'+(o.on?' on':'')+(busy?' busy':'')+'" data-tog="'+id+'"'+(busy?' disabled':'')+
+    '>'+(o.on?(offLabel||'关闭'):(onLabel||'开启'))+(busy?' …':'')+'</button>';
+}
+
+/* ---------- 主渲染 ---------- */
+function render(){
+  var sen=S.sensors||{}, zn=S.zones||{}, lk=S.locks||{}, st=S.state||{};
+  if(st.id){
+    // ⭐ 远程看信号: 现场 WiFi 弱会导致"点了没反应", 所以 RSSI 必须能远程看到。
+    //   >=-60 很好 / -60~-72 正常 / -72~-80 偏弱 / < -80 危险(指令容易丢)
+    var sig='';
+    if(st.rssi!==undefined){
+      var r=Number(st.rssi);
+      sig='  ·  WiFi '+r+'dBm'+(r<-80?'  ⚠信号差':(r<-72?'  ⚠偏弱':''));
+    }
+    $('devName').textContent='· '+st.id+(st.ip?'  ·  '+st.ip:'')+sig;
+  }
+  // ⭐ 固件版本：随 state 上报(GARDEN_FW_VERSION)。看不到 = 固件太旧或没重烧。
+  if($('verFw')){
+    if(st.fw) $('verFw').textContent='v'+st.fw;
+    else      $('verFw').textContent='—（固件未上报版本，多半是没重烧）';
+  }
+  // 设备 ID 以固件上报的为准, 能立刻暴露"面板与固件 ID 不一致"
+  if(st.id && st.id!==connDevId) $('devName').textContent+='  ⚠与面板订阅的 '+connDevId+' 不一致';
+
+  // 气象胶囊
+  var w=sen.weather||{};
+  pill($('pWx'), !w.valid?'':(w.rainy?'warn':'ok'),
+       w.valid ? ('气象 '+esc(w.text||'')+' · 降雨 '+(w.prob!==undefined?w.prob.toFixed(0):'-')+'%'+(w.rainy?' · 判雨':''))
+               : '气象无数据');
+
+  // 空气温湿度胶囊(状态式)。刻意**不显示数字** —— 温湿度只在下方「空气温湿度」
+  // 卡片里看, 免得同一组数字在页面上出现两次。
+  // 但"高温预警"必须留在顶部: 它是要人立刻注意的状态, 不该藏在下面的卡片里。
+  var air=sen.air||{};
+  var airWarn=!!(lk.temp_warn);
+  if(!air.valid)    pill($('pAir'), '',     '空气 未接入');
+  else if(airWarn)  pill($('pAir'), 'warn', '空气 ⚠高温预警');
+  else              pill($('pAir'), 'ok',   '空气 正常');
+
+  var zlist=zn.zones||[], r=zn.refill||{}, html='';
+
+  /* ⭐ 纯土壤节点（车库花坛）: 它不上报 zones，所以下面的区域卡片一张都不会出现。
+     这里走"只有土壤"的分支，直接按探头画卡片 —— 否则整页空着 ✗ */
+  if(!zlist.length){
+    html += soilOnlyHtml(sen);
+  }
+
+  /* ===== 区域模块: 湿度 + 状态 + 阈值 + 浇水阀 ===== */
+  var PH={idle:['待机',''],watering:['浇水中','on'],cooldown:['冷却中','acc'],
+          locked:['已锁定','warn'],fault:['故障','bad']};
+  zlist.forEach(function(z,i){
+    var letter='ABC'[z.id]||String(z.id);
+    var key='soil_'+letter.toLowerCase();
+    var s=sen[key]||{};
+    var ph=PH[z.phase]||[z.phase,''];
+    var lo=(z.low!==undefined)?z.low:30, hi=(z.high!==undefined)?z.high:65;
+    var pct=s.valid?s.pct:null;
+    var dry=(pct!==null && pct<lo);
+
+    var body='';
+    if(s.valid){
+      // 原始 ADC + 换算电压都显示 —— 标定时用得上(电压 = raw × 3.3 / 4095)
+      var volt=(typeof s.raw==='number')?(s.raw*3.3/4095).toFixed(2):'-';
+      body+='<div class="main-val"><div class="num'+(dry?' warn':'')+'">'+pct.toFixed(1)+'<small>%</small></div>'+
+            '<div class="side">原始值 '+(s.raw===undefined?'-':s.raw)+'<br>'+volt+' V</div></div>';
+      body+='<div class="track"><i class="'+(dry?'warn':'')+'" style="width:'+
+            Math.max(2,Math.min(100,pct))+'%"></i>'+
+            '<span class="mk lo" style="left:'+Math.max(0,Math.min(100,lo))+'%" title="下限 '+lo+'%"></span>'+
+            '<span class="mk hi" style="left:'+Math.max(0,Math.min(100,hi))+'%" title="上限 '+hi+'%"></span></div>';
+      body+='<div class="scale"><span>0%</span><span>下限 '+lo+'%</span><span>上限 '+hi+'%</span><span>100%</span></div>';
+    }else{
+      // 读数无效时**也要把原始值打出来** —— 否则没法区分"探头没接"和"探头坏了":
+      //   raw ≈ 0    -> 探头没接 / 线断 / 短路到 GND
+      //   raw ≈ 4095 -> 短路到 3V3
+      var rawTxt=(s.raw===undefined)?'—':s.raw;
+      var rawNum=(typeof s.raw==='number')?s.raw:null;
+      var guess='读数超出有效区间';
+      if(rawNum!==null && rawNum<=50)        guess='原始值 ≈0：探头没接 / 线断了 / 短路到 GND';
+      else if(rawNum!==null && rawNum>=4040) guess='原始值 ≈4095：探头短路到 3V3';
+      body+='<div class="main-val"><div class="num bad">读数无效</div>'+
+            '<div class="side">原始值 '+rawTxt+'</div></div>'+
+            '<p class="hint">'+guess+'。该区域已进入保护（自动浇水暂停）。</p>';
+    }
+    // 回路异常(浇水没效果) -> 显眼提示: 这意味着"浇了也白浇", 要有人去查管路
+    if(z.blocked){
+      body+='<div class="reason" style="background:var(--badbg);color:var(--bad)">'+
+        '<b>⚠ 回路异常：已停止自动浇水</b><br>连续几次浇水都到超时、湿度却没涨 —— '+
+        '多半是管路堵塞 / 电磁阀没开 / 泵没转 / 漏水。查好后土壤自行变湿即自动恢复。</div>';
+    }
+    body+='<div class="reason">当前：<b>'+esc(z.reason||'—')+'</b></div>';
+    body+='<div class="kv2">'+
+      '<span class="k">累计浇水</span><span class="v">'+(z.cycles||0)+' 次 / '+Math.round((z.total_water_s||0)/60)+' 分钟</span>'+
+      '<span class="k">区域编号</span><span class="v">'+z.id+'</span>'+
+      '</div>';
+
+    var outId='water_'+letter.toLowerCase();
+    html+=mod('zone'+letter,'🌿','区域 '+letter+' · 土壤',
+      ph[0],ph[1],body,opsFor([outId]),false,
+      readBtn('soil_'+letter.toLowerCase()));
+  });
+
+  /* ===== 水箱 · 养鱼模块: 水位 + 补水 + 喂鱼 =====
+     鱼就养在水箱里, 所以水位/补水与喂鱼合成一块 —— 一眼看全这条命脉。 */
+  (function(){
+    var l=sen.level||{};
+    var RP={idle:['待机',''],refilling:['补水中','on'],cooldown:['冷却中','acc'],fault:['故障','bad']};
+    var ph=RP[r.phase]||[r.phase||'—',''];
+    var fo=outputs['aux1']||{};
+    var feeding=!!fo.on;
+    // 投喂只是几秒的瞬时动作, 进行时优先占状态位(补水是持续状态)
+    var stTxt=feeding?'投喂中':ph[0];
+    var stCls=feeding?'warn':ph[1];
+
+    // ---- 水位 ----
+    var body='';
+    if(l.valid){
+      var wp=(l.water_pct!==undefined&&l.water_pct>=0)?l.water_pct:null;
+      body+='<div class="main-val"><div class="num">'+(wp===null?'--':wp.toFixed(0))+'<small>%</small></div>'+
+            '<div class="side">距探头 '+(l.distance_cm!==undefined?l.distance_cm.toFixed(1):'-')+' cm</div></div>';
+      if(wp!==null){
+        body+='<div class="track"><i style="width:'+Math.max(2,Math.min(100,wp))+'%"></i></div>';
+      }
+    }else{
+      body+='<div class="main-val"><div class="num bad">未接入</div></div>'+
+            '<p class="hint">水位传感器无有效读数：<b>自动补水已暂停，手动补水也会被强制关断</b>（防溢流）。'+
+            '现在请人工加水；装好水位传感器、读数恢复后，自动与手动补水都会自动恢复。</p>';
+    }
+    body+='<div class="reason">补水：<b>'+esc(r.reason||'—')+'</b></div>';
+    body+='<div class="kv2">'+
+      '<span class="k">下水位线（开始补水）</span><span class="v">'+(r.level_low_cm!==undefined?r.level_low_cm:'-')+' cm</span>'+
+      '<span class="k">上水位线（停止补水）</span><span class="v">'+(r.level_high_cm!==undefined?r.level_high_cm:'-')+' cm</span>'+
+      '<span class="k">补水次数</span><span class="v">'+(r.cycles||0)+' 次 / '+Math.round((r.total_refill_s||0)/60)+' 分钟</span>'+
+      '</div>'+
+      '<p class="hint">距离越大 = 水位越低，所以下水位线的数值大于上水位线。</p>';
+
+    // ---- 喂鱼: 单独一个精简模块（不再和补水挤在同一块里）----
+    var en=(fo.feed_enable===undefined)?true:!!fo.feed_enable;
+    var today=(fo.feed_today===undefined)?null:fo.feed_today;
+    var fs=(fo.feed_sec===undefined)?null:fo.feed_sec;
+    var nextS=(fo.feed_next_s===undefined)?null:fo.feed_next_s;
+    // 下次投喂: 0=正在投喂, -1=今天没有更多时刻
+    var nextTxt='—';
+    if(!en) nextTxt='已关闭';
+    else if(nextS===0) nextTxt='正在投喂…';
+    else if(nextS===null||nextS<0) nextTxt='今天没有更多时刻';
+    else nextTxt='约 '+Math.floor(nextS/3600)+' 小时 '+Math.floor((nextS%3600)/60)+' 分钟';
+
+    var fbody='<div class="reason">喂鱼：<b>'+esc(fo.reason||'—')+'</b></div>'+
+      '<div class="kv2">'+
+        '<span class="k">自动投喂</span><span class="v">'+(en?'已开启':'已关闭')+'</span>'+
+        '<span class="k">每次闭合</span><span class="v">'+(fs===null?'-':(fs+' 秒'))+'</span>'+
+        '<span class="k">今日已喂</span><span class="v">'+(today===null?'-':today)+' 次</span>'+
+        '<span class="k">下次投喂</span><span class="v">'+esc(nextTxt)+'</span>'+
+      '</div>';
+
+    var feedOps = feeding
+      ? '<button class="gh" data-tog="aux1" data-force-off="1">立即停止</button>'
+      : '<button class="pri" data-feed="1">喂一次</button>';
+
+    // ⚠ 水位读数无效时固件会**每秒强制关断**补水阀(防溢流)，所以按钮必须禁用 ——
+    //   否则你会反复点一个永远不生效的按钮，还以为面板坏了。
+    //
+    // ⭐ 手动补水时长: 不用选，统一 15 分钟上限(固件 MANUAL_MAX_SEC)。
+    //   目的就一个 —— 防遗忘: 测电平、验功能、手工换水都够用，
+    //   就算忘了关，15 分钟后也会自动交还规则引擎 ✓
+    var refillOps = l.valid
+      ? opsFor(['refill'])
+      : '<button disabled title="水位读数无效：固件每秒强制关断补水阀（防溢流）。'+
+        '若只是台面测试补水阀，把 config.h 的 REFILL_MANUAL_NO_LEVEL 改成 1 再烧录">'+
+        '补水阀已停用 · 水位无效</button>';
+
+    // ⭐ 两个独立模块, 各占一格: 补水 / 喂鱼
+    html+=mod('tank','💧','水箱补水', ph[0], ph[1], body, refillOps,
+              false, readBtn('water','读水位'));
+    html+=mod('feed','🐟','喂鱼', feeding?'投喂中':(en?'待机':'已关闭'), feeding?'warn':'', fbody, feedOps);
+  })();
+
+  /* ===== 增氧泵模块 ===== */
+  (function(){
+    var o=outputs['light']||{};
+    var on=!!o.on;
+    var autoOn=(valFromConfig('oxygen_auto')===true);
+    var oh=valFromConfig('oxy_on_hour'), om=valFromConfig('oxy_on_min');
+    var fh=valFromConfig('oxy_off_hour'), fm=valFromConfig('oxy_off_min');
+    var cnt=valFromConfig('oxy_times'), dur=valFromConfig('oxy_dur_min');
+    function hm(h,m){
+      if(h===null||m===null) return '—';
+      return ('0'+h).slice(-2)+':'+('0'+m).slice(-2);
+    }
+    var planTxt = autoOn
+      ? (hm(oh,om)+' ~ '+hm(fh,fm)+'　·　'+((cnt===null)?'—':cnt)+' 次/天　·　每次 '+((dur===null)?'—':dur)+' 分钟')
+      : '未启用（纯手动开关）';
+    var modeTxt = autoOn ? '自动计划' : '手动开关';
+    var hint = autoOn
+      ? '时段内自动按计划启停，时段外保持停止。想临时接管就按「开 / 关」，之后按「恢复自动」交还计划。'
+      : '自动计划已关闭：只有「开 / 关」能控制它，设备不会自行启停。';
+    var body='<div class="main-val"><div class="num" style="color:'+(on?'var(--warn)':'var(--dim)')+'">'+
+      (on?'增氧中':'已停止')+'</div></div>'+
+      '<div class="reason">原因：<b>'+esc(o.reason||'—')+'</b></div>'+
+      '<div class="kv2">'+
+        '<span class="k">控制方式</span><span class="v">'+modeTxt+'</span>'+
+        '<span class="k">自动计划</span><span class="v">'+planTxt+'</span>'+
+      '</div>'+
+      '<p class="hint">220V 增氧泵接在这一路（继电器 GPIO4）。'+hint+'</p>';
+    html+=mod('light','💨','增氧泵',on?'增氧中':'已停止',on?'warn':'',body,opsFor(['light']));
+  })();
+
+  /* 原来单独的「自动喂鱼」模块已并入上面的「水箱 · 养鱼」(鱼养在水箱里, 一块看更顺)。 */
+
+  /* ===== 空气温湿度模块 (DHT11) =====
+     补这个模块的原因: 以前这路数据只被"尚未接入的模块"那块用过 ——
+     传感器没接时显示"未接入", 一旦接上、读数有效, 那块整体消失,
+     于是空气读数哪儿都不显示了(实测踩到)。 */
+  (function(){
+    var a=sen.air||{};
+    var warn=!!(lk.temp_warn);
+    var tHigh=valFromConfig('air_temp_warn');
+    var hRain=valFromConfig('air_humid_rain');
+    var body;
+    if(a.valid){
+      var t=(typeof a.temp_c==='number')?a.temp_c.toFixed(1):'-';
+      var h=(typeof a.humid==='number')?a.humid.toFixed(0):'-';
+      var humidHigh=(hRain!==null && typeof a.humid==='number' && a.humid>=hRain);
+      body='<div class="main-val"><div class="num'+(warn?' warn':'')+'">'+t+'<small>°C</small></div>'+
+        '<div class="side">空气湿度 '+h+'%</div></div>'+
+        '<div class="reason">'+(warn
+          ? '⚠ <b>已触发高温预警</b>（只告警与采集，不触发浇水）'
+          : '当前：正常采集')+'</div>'+
+        '<div class="kv2">'+
+          '<span class="k">高温预警阈值</span><span class="v">'+(tHigh===null?'-':tHigh)+' °C</span>'+
+          '<span class="k">空气高湿阈值</span><span class="v">'+(hRain===null?'-':hRain)+' %</span>'+
+          '<span class="k">本地判雨</span><span class="v">'+
+            (humidHigh?'空气已达标，还需<b>全部区域</b>土壤湿透':'空气未达标')+'</span>'+
+        '</div>'+
+        '<p class="hint">这一路是需求3「空气高湿 ∩ 土壤高湿」判雨的一半判据。'+
+        '它读不到时本地判雨自动跳过，网络气象判雨与浇水都不受影响。</p>';
+    }else{
+      body='<div class="main-val"><div class="num bad">未接入</div></div>'+
+        '<p class="hint">DHT11 无有效读数（未接线 / 供电不是 3.3V / 单总线时序被打断）。'+
+        '本地判雨「空气高湿∩土壤高湿」已跳过，网络气象判雨与浇水照常。</p>';
+    }
+    html+=mod('air','🌡','空气温湿度',
+      a.valid?(warn?'高温预警':'正常'):'未接入',
+      a.valid?(warn?'warn':'ok'):'miss',
+      body,'',false,readBtn('air'));
+  })();
+
+  /* ===== 预留输出模块 (仅剩 aux2) ===== */
+  (function(){
+    var ids=['aux2'].filter(function(id){ return outputs[id]; });
+    if(!ids.length) return;
+    var body='<p class="hint">预留通道，可用于风扇、加热、摄像头供电等。当前未绑定自动规则，仅手动控制。</p>';
+    ids.forEach(function(id){
+      var o=outputs[id]||{};
+      body+='<div class="kv"><span class="k">'+(NAME[id]||id)+'</span><span class="v">'+
+        (o.on?'<b style="color:var(--ok)">已开</b>':'已关')+' · '+esc(o.reason||'')+'</span></div>';
+    });
+    html+=mod('aux','🔌','预留输出','待机','',body,opsFor(ids));
+  })();
+
+  /* ===== 未接入的传感器(合并成一块, 不占主视线) ===== */
+  (function(){
+    var a=sen.air||{};
+    if(a.valid) return;   // DHT11 接入后就不再显示这块提示
+    html+='<div class="mod wide" data-block="missing"><div class="mod-h">'+
+      '<span class="ic">📦</span><span class="nm">尚未接入的模块</span>'+
+      '<span class="st miss">待安装</span></div><div class="mod-b">'+
+      '<div class="kv"><span class="k">空气温湿度 DHT11</span><span class="v">未接入 · 本地判雨已跳过</span></div>'+
+      '<div class="kv"><span class="k">水位传感器</span><span class="v">'+
+        ((sen.level&&sen.level.valid)?'已接入':'未接入 · 自动补水已暂停')+'</span></div>'+
+      '<p class="hint">这两项缺失时，系统仍能正常工作：需求4 的网络气象判雨、两路土壤浇水都不受影响。</p>'+
+      '</div></div>';
+  })();
+
+  $('board').innerHTML=html;
+  renderLocks(lk);
+}
+
+/* ---------- 锁定/告警横幅 ---------- */
+function renderLocks(d){
+  var act=(d.locks||[]).filter(function(l){ return l.active; });
+  var bar=$('lockBar'), extra=[];
+  if(d.temp_warn) extra.push('高温预警（仅告警，不影响浇水）');
+  if(d.raining)   extra.push('当前判定为雨天，已停止自动浇水');
+  if(!act.length && !extra.length){ bar.classList.remove('show'); return; }
+  bar.classList.add('show');
+  var h='';
+  if(act.length){
+    h+='<b>⏸ 已暂停自动浇水</b>';
+    h+=act.map(function(l){
+      var m=Math.round((l.left_s||0)/60);
+      return '<div>· <b>'+esc(l.source||'')+'</b>：'+esc(l.note||'')+(m>0?'（剩余约 '+m+' 分钟）':'')+'</div>';
+    }).join('');
+  }
+  h+=extra.map(function(x){ return '<div>· '+x+'</div>'; }).join('');
+  bar.innerHTML=h;
+}
+
+/* ---------- 日志 ---------- */
+function logLine(topic,text){
+  var el=$('log');
+  var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  el.textContent='['+t+'] '+topic+'\n'+text+'\n'+el.textContent;
+  if(el.textContent.length>5000) el.textContent=el.textContent.slice(0,5000);
+}
+
+/* ---------- 下发指令 ---------- */
+function pub(obj){
+  if(!client||!client.connected){ pill($('pMq'),'bad','未连接，无法下发');
+    logLine('send','❌ MQTT 未连接，指令**没有发出**'); return false; }
+  var topic=base()+'/cmd/output', pl=JSON.stringify(obj);
+  // ⭐ 把"我们发出去的指令"也记进日志区。
+  //   以前只记收到的报文 → 出问题时根本看不到"到底发了什么、发没发出去" ✗
+  logLine('send','📤 发出 '+topic+'  '+pl);
+  // ⭐⭐ 设备离线时**不拦**（availability 有延迟，拦了容易误伤），但明确警告可能丢包 ✗
+  //   因为设备订阅是 QoS 0，离线期间的指令 broker 不保留 —— 这就是"点了没反应"的根因 ✓
+  if(!devOnline){
+    logLine('send','⚠ 设备当前显示离线 —— 这条指令很可能被 broker 丢弃。'+
+      '等「设备在线」变绿再操作，或稍后确认状态是否真的变了');
+  }
+  // ⚠ 必须用 QoS 1: QoS 0 是"发了就不管", 手机网络一抖动指令就丢了,
+  //   现场表现是"点一下没反应, 再点一下才生效"(间歇性失灵)。
+  //   重复的指令是幂等的(重复开=还是开), 所以 QoS 1 的重发没有副作用。
+  client.publish(topic, pl, {qos:1}, function(err){
+    if(err) logLine('send','❌ 发布失败: '+(err&&err.message?err.message:err)+
+      ' —— 指令没到 broker（手机网络/订阅权限问题）');
+    else    logLine('send','✅ broker 已确认收到（QoS1）—— 接下来看设备是否回报状态');
+  });
+  return true;
+}
+
+/* 下发到任意子主题（读数 / 照明等）。pub() 只会发 cmd/output，不够用。 */
+function pubRaw(sub,payload){
+  if(!client||!client.connected){ pill($('pMq'),'bad','未连接，无法下发');
+    logLine('send','❌ MQTT 未连接，指令**没有发出**'); return false; }
+  var topic=base()+'/'+sub;
+  logLine('send','📤 发出 '+topic+'  '+payload);
+  client.publish(topic, payload, {qos:1}, function(err){
+    if(err) logLine('send','❌ 发布失败: '+(err&&err.message?err.message:err));
+    else    logLine('send','✅ broker 已确认收到');
+  });
+  return true;
+}
+/* 等待回执 + 弱网自动重发。
+   QoS 1 能保证"手机 → broker"这一段, 但 broker → 设备 那一段仍是 QoS 0
+   (PubSubClient 的订阅是 QoS 0), 现场 WiFi 弱时指令仍会丢。
+   所以这里做应用层重试: 2.5 秒还没看到状态变成期望值, 就再发一次, 最多补发 2 次。
+   desired 不传就只做"等 6 秒后清 pending", 不重发。 */
+function markPending(id, desired, holdSec){
+  pending[id]=1;
+  // ⭐ 记住"期望状态", 让 outputs 处理器只在状态真的对上时才清 pending ✓
+  //   (原来无条件清, 导致按钮提前恢复、停止重试 ✗)
+  if(desired===undefined) delete pendingWant[id]; else pendingWant[id]=!!desired;
+  render();
+  var tries=0;
+  (function check(){
+    setTimeout(function(){
+      if(!pending[id]) return;                        // 已收到回执
+      if(desired===undefined){ delete pending[id]; delete pendingWant[id]; render(); return; }
+      var cur=!!(outputs[id]&&outputs[id].on);
+      if(cur===desired){ delete pending[id]; delete pendingWant[id]; render(); return; }
+      if(tries<2 && client && client.connected){
+        tries++;
+        logLine('retry','重发指令 '+id+' → '+(desired?'开':'关')+' (第 '+tries+' 次)');
+        // ⚠ 这里必须和正常下发用同一个时长(900 秒 = 15 分钟)，
+        //   否则"重发"会把保持时间悄悄改成别的值 ✗
+        client.publish(base()+'/cmd/output',
+          JSON.stringify({output:id,state:desired,timeout_s:holdSec||900}),{qos:1});
+        check();
+      }else{
+        // ⭐ 重试用尽还没回执 → 明确告诉用户"设备没响应"，不要静默把按钮解灰
+        //   否则用户只会觉得"点了没用"，不知道是没送达还是被拒绝 ✗
+        logLine('fail','⚠ 指令 '+id+' 无回执：设备未响应或指令未送达。'+
+          '请展开「远程诊断」看设备有没有收到（cmd 计数是否增加）');
+        delete pending[id]; delete pendingWant[id]; render();
+      }
+    }, 2500);
+  })();
+}
+/* 说明：「读数」按钮现在长在各自卡片的标题栏里(见 readBtn/mod)，
+   所以由下面 board 的点击代理统一处理，不需要单独监听。 */
+$('board').addEventListener('click',function(ev){
+  var b=ev.target.closest('button'); if(!b) return;
+  var tog=b.getAttribute('data-tog'), aut=b.getAttribute('data-auto'), feed=b.getAttribute('data-feed');
+  // ⭐ 手动读数: 只发一条 cmd/read, 固件立刻采一次并在 600ms 后补发新值
+  var rdt=b.getAttribute('data-read');
+  if(rdt){
+    if(pubRaw('cmd/read',rdt)){
+      var old=b.textContent;
+      b.disabled=true; b.textContent='读数…';
+      setTimeout(function(){ b.disabled=false; b.textContent=old; },1800);
+    }
+    return;
+  }
+  if(tog){
+    var cur=outputs[tog]||{};
+    // 「立即停止」是纯关闭动作, 不需要手动保持
+    if(b.getAttribute('data-force-off')){
+      if(pub({output:tog,state:false,timeout_s:5})) markPending(tog, false, 5);
+      return;
+    }
+    // 手动保持时长:
+    //   · 喂食器: 只给一个投喂脉冲(取固件上报的每次投喂时长)
+    //   · 其余通道: 15 分钟(900 秒) —— 与固件 MANUAL_MAX_SEC 一致，
+    //     纯粹为了"防遗忘": 忘了关也会在 15 分钟后自动交还规则引擎 ✓
+    var hold=(tog==='aux1')?Math.max(1,Math.min(60,(cur.feed_sec||5))):900;
+    var want=!cur.on;
+    if(pub({output:tog,state:want,timeout_s:hold})) markPending(tog, want, hold);
+  }else if(feed){
+    // 「喂一次」: 开一次喂食器, 时长取固件上报的每次投喂时长(默认 5 秒)
+    var fs=(outputs['aux1']&&outputs['aux1'].feed_sec)||5;
+    if(pub({output:'aux1',state:true,timeout_s:fs})) markPending('aux1', true, fs);
+  }else if(aut){
+    if(pub({output:aut,mode:'auto'})) markPending(aut);
+  }
+});
+
+/* ---------- 启动 ---------- */
+/* ---------- 启动 ---------- */
+function boot(){
+  loadLocal();
+  $('host').value=cfg.host; $('port').value=cfg.port; $('dev').value=cfg.dev;
+  $('muser').value=cfg.user||''; $('mpass').value=cfg.pass||''; $('mpath').value=cfg.path||'/mqtt';
+  initDevSel();
+  renderNodes();          // ⭐ 顶部节点按钮（我家小院 / 车库花坛 / 老家菜地）
+  // ⭐ 载入"设备离线次数"统计（按设备 ID 从 localStorage 取，刷新不清零）
+  devStatLoad(); showDevStat();
+  // ⭐ 版本行的「清零」按钮
+  if($('btnClearStat')) $('btnClearStat').onclick=clearDevStat;
+
+  ['host','port','dev','muser','mpass','mpath'].forEach(function(id){
+    $(id).addEventListener('change',function(){
+      saveCfg();
+      // ⭐ 切换设备时同步切换它的离线统计（各设备分开计数）
+      if(id==='dev'){ devStatLoad(); showDevStat(); }
+    });
+    // 边输入边提示: 改了设备 ID 立刻告诉用户"需要重新点连接"(避免误判成设备掉线)
+    $(id).addEventListener('input',function(){ updateStatus(); });
+  });
+
+  $('btnConn').onclick=connect;
+  $('btnDisc').onclick=disconnect;
+  $('btnReconnect').onclick=connect;
+
+  // 参数设置面板
+  var cp=$('cfgPanel');
+  if(cp){
+    cp.addEventListener('input',function(ev){ if(ev.target&&ev.target.getAttribute('data-cfg')) onCfgEdit(ev.target); });
+    cp.addEventListener('change',function(ev){ if(ev.target&&ev.target.getAttribute('data-cfg')) onCfgEdit(ev.target); });
+  }
+  var bs=$('btnCfgSave');
+  if(bs) bs.onclick=saveCfgToDevice;
+
+  // ⭐ 参数快照「导出 / 恢复」相关绑定
+  var bd=$('btnCfgDump');
+  if(bd) bd.onclick=dumpCfgSnapshot;
+  // ⭐ 页面上的「恢复参数」: 直接开浮层并清空, 让用户粘贴
+  var bgr=$('btnCfgRestore');
+  if(bgr) bgr.onclick=openRestoreBox;
+  var bf=$('btnDumpFill');
+  if(bf) bf.onclick=fillCfgSnapshot;
+  var bg=$('btnDumpSave');
+  if(bg) bg.onclick=downloadCfgSnapshot;
+  var br=$('btnDumpRestore');
+  if(br) br.onclick=restoreCfgFromText;
+  var bc=$('btnDumpCopy');
+  if(bc) bc.onclick=copyDump;
+  var bx=$('btnDumpClose');
+  if(bx) bx.onclick=function(){ var o=$('dumpBox'); if(o) o.classList.remove('show'); };
+  var ob=$('dumpBox');
+  if(ob) ob.onclick=function(ev){ if(ev.target===ob) ob.classList.remove('show'); };
+
+  render();          // 先渲染空状态骨架, 让页面结构立刻出现
+  renderCfg();
+  updateStatus();
+
+  if(cfg.host&&cfg.dev) connect();
+}
+boot();
+})();
+</script>
+</body>
+</html>
