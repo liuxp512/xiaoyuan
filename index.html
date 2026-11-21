@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -462,7 +462,7 @@ var DEVICES=NODES.map(function(n){ return n.dev; });
 // ⭐ 面板版本 —— 每次改面板都改这个日期。
 //   页面上会显示它: 如果还是旧日期, 说明手机加载的是**缓存里的旧面板** ✗
 //   (打开时在地址后面加 ?v=1027 这类参数可以强制重新拉)
-var PANEL_VER='2026-10-30f';   // h: 参数快照 导出/下载文件/一键恢复(换芯片丢参数) + 诊断 rec/wd + 清零 + 离线统计
+var PANEL_VER='2026-11-21a';   // h: 参数快照 导出/下载文件/一键恢复(换芯片丢参数) + 诊断 rec/wd + 清零 + 离线统计
 
 var S={};                    // 最新快照: sensors / zones / outputs / locks / state
 var outputs={},pending={},pendingWant={},lastDataAt=0;
@@ -563,6 +563,21 @@ var devOnline=false, lastErr='';
 var devOfflineTimer=0;
 var DEV_GRACE_MS=8000;
 
+/* ⭐⭐ 设备「假离线」去抖（2026-11-13 新增）
+   现场问题: 每 30 分钟 MQTT 会断一次、约 13 秒后自动重连
+             (根因是固件里气象 HTTPS 抓取阻塞主循环 8~9 秒, 撞 socket 读超时;
+              已定位, 待固件 1.4.0 换数据源后消失)
+   面板表现: 顶部「设备在线」闪成红色、弹出"设备离线"横幅、离线次数 +1 ✗
+             —— 但设备其实 13 秒就回来了, 数据一条没丢 ✗
+
+   做法: 收到 LWT 的 `offline` 后先**不认**，给它 20 秒确认窗口 ✓
+         · 20 秒内收到 `online` → 判定为网络抖动, 只写一行日志, **不计入离线统计**
+         · 20 秒后才真算离线（计次 + 记时间）✓
+   为什么是 20 秒: 实测闪断 13 秒; 留 7 秒余量, 又不至于掩盖真的掉线 ✓
+   代价: 设备真掉线时晚 20 秒报警（可接受 —— 菜园不是手术室）✓ */
+var devOffTimer=0, pendingOffAt=0;
+var DEV_OFF_CONFIRM_MS=20000;
+
 // ⭐⭐ 面板自己重连了几次
 //   为什么必须单独数: 现场观察到"Mqtt 标签变黄(连接中) + 设备在线闪离线"同时发生,
 //   说明是**面板自己**与 broker 断开 ✗ 而面板断线的那几秒里点击 → pub() 直接拦下,
@@ -596,8 +611,15 @@ function devStatLoad(){
     var raw=localStorage.getItem(DEV_STAT_KEY+devIdNow());
     var s=raw?JSON.parse(raw):null;
     if(s && typeof s==='object'){
-      devStat={off:s.off|0, lastOffAt:s.lastOffAt|0,
-               offTotalS:s.offTotalS|0, watchFrom:s.watchFrom|0};
+      // ⚠⚠ 坑: `|0` 会把 13 位的毫秒时间戳截成 32 位(变成负数或乱数)。
+      //   后果: 刷新一次面板, "离线多久"就算错 —— 历史记录里出现过 +3318 秒的假数值。
+      //   所以计数用 |0, 时间戳必须用 +x 保留完整精度 ✓
+      var _now=Date.now();
+      var _last=(+s.lastOffAt)||0, _watch=(+s.watchFrom)||0;
+      if(_last>_now || _last<1600000000000) _last=0;    // 明显不合理就丢掉, 别污染统计
+      if(_watch>_now || _watch<1600000000000) _watch=_now;
+      devStat={off:(+s.off)|0, lastOffAt:_last,
+               offTotalS:(+s.offTotalS)|0, watchFrom:_watch};
       return;
     }
   }catch(e){}
@@ -726,6 +748,77 @@ function updateBanner(){
   document.body.classList.toggle('stale', age>90);
 }
 
+/* ⭐⭐⭐ 面板自抓气象（2026-11-13）
+   背景: 固件原来用 Open-Meteo, 该域名在国内已不可达（实测超时 8~12 秒）,
+         于是设备上报的 weather.valid 一直是 false → 面板上气象永远"无数据" ✗
+         更糟的是设备每 30 分钟还要为它阻塞 8~9 秒, 把 MQTT 拖到读超时 → 掉线 ✗
+
+   做法: 面板自己在浏览器里查**中国气象局**（weather.cma.cn）✓
+         · 免注册、免 key、官方数据
+         · 实测 130~260 ms, 报文约 2.2 KB
+         · 站点 57475 = 湖北潜江（按菜地坐标 30.43N/112.88E 反查，最近站）
+         · 它带 `Access-Control-Allow-Origin: *` 且支持 HTTPS → 浏览器可直连 ✓
+
+   ⚠ 重要区别（必须说清，别让人误以为修好了）:
+     · 面板显示的气象 ← 本函数，**现在就能用** ✓
+     · 设备的"降雨锁浇水" ← 在固件里，**仍然是坏的**，要等 1.4.0 才修 ✗
+     也就是说: 你能看见天气，但设备不会因为"预报有雨"而停止浇水 ✗
+
+   判雨规则用气象局的天气现象代码（dayCode/nightCode）:
+     雨: 3 阵雨, 4 雷阵雨, 5 雷阵雨伴冰雹, 6 雨夹雪, 7 小雨, 8 中雨, 9 大雨,
+         10 暴雨, 11 大暴雨, 12 特大暴雨, 19 冻雨, 21 小到中雨, 22 中到大雨,
+         23 大到暴雨, 24 暴雨到大暴雨, 25 大暴雨到特大暴雨
+     雪: 13 阵雪, 14 小雪, 15 中雪, 16 大雪, 17 暴雪, 26 小到中雪, 27 中到大雪, 28 大到暴雪
+     雪也算降水 → 同样该锁浇水 ✓
+*/
+var WX_STATION='57475', WX_STATION_NAME='潜江';
+var wxCache={at:0, data:null, busy:false};
+
+function wxIsWetCode(c){
+  c=Number(c);
+  if(!isFinite(c)) return false;
+  return [3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,19,
+          21,22,23,24,25,26,27,28].indexOf(c)>=0;
+}
+
+function wxFetchIfStale(){
+  if(wxCache.busy) return;
+  if(Date.now()-wxCache.at < 30*60*1000) return;      // 30 分钟缓存
+  wxCache.busy=true;
+  wxCache.at=Date.now();
+  fetch('https://weather.cma.cn/api/weather/view?stationid='+WX_STATION,{cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      var d=j&&j.data;
+      if(!d || !d.daily || !d.daily.length) throw new Error('气象接口无数据');
+      var now=d.now||{}, t0=d.daily[0]||{}, t1=d.daily[1]||{};
+      var cur=Number(now.precipitation)||0;
+      var wetToday   =(wxIsWetCode(t0.dayCode)   || wxIsWetCode(t0.nightCode));
+      var wetTomorrow=(wxIsWetCode(t1.dayCode)   || wxIsWetCode(t1.nightCode));
+      wxCache.data={
+        valid:true,
+        rainy: cur>0 || wetToday || wetTomorrow,
+        prob: null,                       // ⭐ 气象局接口不给"概率"，如实留空，不编数字
+        precip_mm: cur,
+        text: (t0.dayText||'—')+(t1.dayText?(' → '+t1.dayText):''),
+        today: t0.dayText||'', tomorrow: t1.dayText||'',
+        code: t0.dayCode,
+        station: WX_STATION_NAME,
+        lastUpdate: d.lastUpdate||'',
+        observed: cur>0
+      };
+      wxCache.busy=false;
+      logLine('conn','🌤 面板直查气象成功：'+WX_STATION_NAME+' '+wxCache.data.text+
+                     (cur>0?('，正在降水 '+cur+'mm'):'')+(wxCache.data.rainy?' → 判雨':''));
+      if(typeof render==='function') render();
+    })
+    .catch(function(){
+      wxCache.busy=false;
+      // ⭐ 失败后 5 分钟再试（而不是等满 30 分钟），接口抽风时能快速自愈 ✓
+      wxCache.at=Date.now()-25*60*1000;
+    });
+}
+
 /* ---------- 连接 ---------- */
 function connect(){
   saveCfg();
@@ -743,7 +836,12 @@ function connect(){
     var pth=cfg.path||'/mqtt'; if(pth.charAt(0)!=='/') pth='/'+pth;
     var url=(String(cfg.port)==='8083'?'ws://':'wss://')+cfg.host+':'+cfg.port+pth;
     var opt={clientId:'dash_'+Math.random().toString(16).slice(2,10),
-             keepalive:30,reconnectPeriod:5000,connectTimeout:8000,clean:true};
+             keepalive:120,reconnectPeriod:5000,connectTimeout:8000,clean:true};
+    // ⭐⭐⭐ 2026-11-21: keepalive 30 → 120 秒。
+    //   原因: 浏览器对**后台标签页**的定时器会节流到每分钟 1 次 ✗
+    //   keepalive=30 时 broker 的断开死线只有 1.5×30 = **45 秒** ✗
+    //   → 后台标签页 PINGREQ 变成 60 秒一次 → 60 > 45 → broker 断开 → 面板疯狂重连 ✗✗
+    //   改成 120 秒后死线是 180 秒 ✓ 即使被节流到 60 秒也安全 ✓
     if(cfg.user) opt.username=cfg.user;          // 私有 Broker 认证
     if(cfg.pass) opt.password=cfg.pass;
     client=mqtt.connect(url,opt);
@@ -827,22 +925,44 @@ function onMsg(topic,text){
 
   if(sub==='availability'){
     var nowOn=(String(text).trim()==='online');
-    // ⭐ 只在 online→offline 的**转变**时计数（retained 会重复投递，盲目 +1 会重复计数）
-    if(devOnline && !nowOn){
-      devStat.off++;
-      devStat.lastOffAt=Date.now();
-      devStatSave(); showDevStat();
-      logLine('conn','📴 设备掉线 —— 累计第 '+devStat.off+' 次');
-    }else if(!devOnline && nowOn && devStat.lastOffAt){
-      var sec=Math.round((Date.now()-devStat.lastOffAt)/1000);
-      if(sec>=0 && sec<86400) devStat.offTotalS+=sec;   // 超过一天的不计(多半是面板关了)
-      devStat.lastOffAt=0;
-      devStatSave(); showDevStat();
-      logLine('conn','📶 设备恢复在线 —— 这次离线约 '+sec+' 秒，累计离线 '+devStat.offTotalS+' 秒');
-    }
-    devOnline=nowOn;
     cancelDevGrace();        // ⭐ 收到设备的权威答复, 取消宽限计时
-    pill($('pDev'),devOnline?'ok':'bad',devOnline?'设备在线':'设备离线');
+
+    if(nowOn){
+      /* ── 恢复在线 ── */
+      var wasPending=!!devOffTimer;
+      if(devOffTimer){ clearTimeout(devOffTimer); devOffTimer=0; }
+      if(wasPending){
+        // ⭐⭐ 20 秒内自己回来了 → 网络抖动，不是真掉线，不计次 ✓
+        var blipS=Math.round((Date.now()-pendingOffAt)/1000);
+        devStat.lastOffAt=0;
+        logLine('conn','⚡ 设备闪断后自动恢复（约 '+blipS+' 秒）—— 判为网络抖动，不计入离线统计');
+      }else if(!devOnline && devStat.lastOffAt){
+        var sec=Math.round((Date.now()-devStat.lastOffAt)/1000);
+        if(sec>=0 && sec<86400) devStat.offTotalS+=sec;   // 超过一天的不计(多半是面板关了)
+        devStat.lastOffAt=0;
+        devStatSave(); showDevStat();
+        logLine('conn','📶 设备恢复在线 —— 这次离线约 '+sec+' 秒，累计离线 '+devStat.offTotalS+' 秒');
+      }
+      devOnline=true;
+      pill($('pDev'),'ok','设备在线');
+    }else{
+      /* ── 收到 offline：先不认，等确认窗口 ── */
+      if(devOnline && !devOffTimer){
+        pendingOffAt=Date.now();
+        pill($('pDev'),'warn','网络抖动…');       // 中间态: 既不说在线, 也不急着说离线 ✓
+        devOffTimer=setTimeout(function(){
+          devOffTimer=0;
+          devOnline=false;
+          devStat.off++;
+          devStat.lastOffAt=Date.now();
+          devStatSave(); showDevStat();
+          logLine('conn','📴 设备掉线 —— 累计第 '+devStat.off+' 次');
+          pill($('pDev'),'bad','设备离线');
+          updateStatus(); render();
+        }, DEV_OFF_CONFIRM_MS);
+      }
+      // 已经是离线状态又收到 offline(retained 重投) → 什么都不做 ✓
+    }
     updateStatus();
     return;
   }
@@ -1487,10 +1607,36 @@ function render(){
   if(st.id && st.id!==connDevId) $('devName').textContent+='  ⚠与面板订阅的 '+connDevId+' 不一致';
 
   // 气象胶囊
+  // ⭐⭐ 双来源: 设备上报优先（它能驱动"降雨锁"，权威）；设备无数据时用面板直查兜底 ✓
+  //    这一点必须区分开 —— 设备 valid=false 时，即使面板显示了天气，
+  //    设备的降雨锁**依然是失效的** ✗ (修复要等固件 1.4.0 换气象源)
   var w=sen.weather||{};
-  pill($('pWx'), !w.valid?'':(w.rainy?'warn':'ok'),
-       w.valid ? ('气象 '+esc(w.text||'')+' · 降雨 '+(w.prob!==undefined?w.prob.toFixed(0):'-')+'%'+(w.rainy?' · 判雨':''))
-               : '气象无数据');
+  var wxSrc='', wxValid=false, wxRainy=false, wxProb=null, wxText='';
+  if(w.valid){
+    wxSrc='设备'; wxValid=true; wxRainy=!!w.rainy;
+    wxProb=(w.prob===undefined||w.prob===null)?null:Number(w.prob);
+    wxText=w.text||'';
+  }else{
+    wxFetchIfStale();                    // 面板自己查（30 分钟缓存，不狂刷）
+    if(wxCache.data && wxCache.data.valid){
+      wxSrc='面板直查'; wxValid=true; wxRainy=!!wxCache.data.rainy;
+      wxProb=null;                       // 气象局不给概率
+      wxText=wxCache.data.text||'';
+    }
+  }
+  if(!wxValid){
+    pill($('pWx'),'', '气象无数据');
+  }else{
+    var wxTxt='气象 '+esc(wxText);
+    if(wxProb!==null && isFinite(wxProb)) wxTxt+=' · 降雨 '+wxProb.toFixed(0)+'%';
+    else if(wxCache.data && wxSrc==='面板直查'){
+      // ⭐ 用"正在下 / 预报有雨 / 无雨"代替编造一个百分比 ✓
+      wxTxt+=' · '+(wxCache.data.observed?'正在降水':(wxRainy?'预报有雨':'预报无雨'));
+    }
+    if(wxRainy) wxTxt+=' · 判雨';
+    if(wxSrc==='面板直查') wxTxt+=' · 面板直查';
+    pill($('pWx'), wxRainy?'warn':'ok', wxTxt);
+  }
 
   // 空气温湿度胶囊(状态式)。刻意**不显示数字** —— 温湿度只在下方「空气温湿度」
   // 卡片里看, 免得同一组数字在页面上出现两次。
